@@ -3,25 +3,28 @@ model.py
 --------
 1D-ResNet architecture for Human Activity Recognition (HAR).
 
-Input  : (Batch, 6, 300)   – 6 channels × 300 timesteps
+Input  : (Batch, 8, 300)   – 8 channels × 300 timesteps
+                              (6 raw sensor channels + 2 magnitude channels)
 Output : (Batch, 6)        – 6-class logit vector
 
 Architecture outline
 ────────────────────
-  Stem:  Conv1d(6→64, k=11, s=2) → BN → ReLU → MaxPool(k=3, s=2)
+  Stem:  Conv1d(8→64, k=11, s=2) → BN → ReLU → MaxPool(k=3, s=2)
   Stage 1: ResBlock(64→64)  × 2
   Stage 2: ResBlock(64→128) × 2  [stride-2 downsample]
   Spatial Dropout1d(p=0.2)        ← inserted between Stage 2 and Stage 3
   Stage 3: ResBlock(128→256)× 2  [stride-2 downsample]
   Stage 4: ResBlock(256→512)× 2  [stride-2 downsample]
-  Head:  Global Average Pooling → Dropout(p=0.5) → FC(512→6)
+  Head:  Global Average Pooling → Dropout(p=0.4) → FC(512→6)
 
-Regularisation changes (v2)
+Regularisation changes (v3)
 ───────────────────────────
-  • Spatial Dropout1d(p=0.2) between Stage 2 and Stage 3 drops entire
-    feature-map channels to discourage channel co-adaptation.
-  • Classifier head dropout increased from p=0.3 → p=0.5 for stronger
-    regularisation before the final linear projection.
+  • in_channels updated from 6 → 8 to accommodate the two new magnitude
+    feature channels (mean_mag, std_mag) engineered in dataset.py.
+  • Classifier head dropout annealed from p=0.5 → p=0.4 to reduce
+    over-suppression of highly abstracted features at the final projection.
+  • Spatial Dropout1d(p=0.2) between Stage 2 and Stage 3 is retained
+    unchanged to discourage channel co-adaptation.
 
 Total parameters: ~3.5 M  (fits comfortably in 8 GB VRAM even with large batches)
 """
@@ -88,13 +91,13 @@ class ResNet1D(nn.Module):
 
     Parameters
     ----------
-    in_channels  : int  – number of sensor channels (default 6)
+    in_channels  : int  – number of sensor channels (default 8: 6 raw + 2 magnitude)
     num_classes  : int  – number of output classes  (default 6)
     base_filters : int  – width multiplier for the residual stages (default 64)
     """
 
     def __init__(self,
-                 in_channels: int  = 6,
+                 in_channels: int  = 8,
                  num_classes: int  = 6,
                  base_filters: int = 64):
         super().__init__()
@@ -104,6 +107,7 @@ class ResNet1D(nn.Module):
         # ── Stem ──────────────────────────────────────────────────────────────
         # Large receptive field k=11 to capture broad temporal context at the
         # very first layer (covers ~11 consecutive time-steps).
+        # in_channels updated to 8 (v3) to ingest the two magnitude channels.
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, f,
                       kernel_size=11, stride=2, padding=5, bias=False),   # L: 300 → 150
@@ -129,6 +133,7 @@ class ResNet1D(nn.Module):
         # nn.Dropout1d zeros entire channels (feature maps) along the temporal
         # dimension, providing stronger regularisation than element-wise dropout
         # and preventing the model from over-relying on any single feature map.
+        # Retained at p=0.2 (unchanged from v2).
         self.spatial_dropout = nn.Dropout1d(p=0.2)
 
         # Stage 3 – double channels, halve length, 2 blocks
@@ -147,9 +152,10 @@ class ResNet1D(nn.Module):
         # Global Average Pooling: collapses temporal dimension → (B, f*8)
         self.gap = nn.AdaptiveAvgPool1d(1)
 
-        # Increased dropout probability p=0.5 (was p=0.3) before the classifier
-        # to apply stronger regularisation and reduce over-fitting on training subjects.
-        self.dropout = nn.Dropout(p=0.5)
+        # Dropout annealed to p=0.4 (v3, was p=0.5) before the classifier to
+        # reduce over-suppression of highly abstracted features in the final
+        # linear projection while still providing meaningful regularisation.
+        self.dropout = nn.Dropout(p=0.4)
 
         # Final fully-connected classifier
         self.fc = nn.Linear(f * 8, num_classes)
@@ -175,7 +181,7 @@ class ResNet1D(nn.Module):
         """
         Parameters
         ----------
-        x : torch.Tensor, shape (B, 6, 300)
+        x : torch.Tensor, shape (B, 8, 300)
 
         Returns
         -------
@@ -184,12 +190,12 @@ class ResNet1D(nn.Module):
         x = self.stem(x)             # (B, 64,  75)
         x = self.stage1(x)           # (B, 64,  75)
         x = self.stage2(x)           # (B, 128, 38)
-        x = self.spatial_dropout(x)  # (B, 128, 38) – drop whole channels
+        x = self.spatial_dropout(x)  # (B, 128, 38) – drop whole channels (p=0.2)
         x = self.stage3(x)           # (B, 256, 19)
         x = self.stage4(x)           # (B, 512, 10)
         x = self.gap(x)              # (B, 512,  1)
         x = x.squeeze(-1)            # (B, 512)
-        x = self.dropout(x)          # (B, 512) – p=0.5
+        x = self.dropout(x)          # (B, 512) – p=0.4
         x = self.fc(x)               # (B, 6)
         return x
 
@@ -199,8 +205,8 @@ class ResNet1D(nn.Module):
 # ──────────────────────────────────────────
 
 def _test_model():
-    model = ResNet1D(in_channels=6, num_classes=6)
-    dummy = torch.randn(32, 6, 300)
+    model = ResNet1D(in_channels=8, num_classes=6)
+    dummy = torch.randn(32, 8, 300)
     out   = model(dummy)
     assert out.shape == (32, 6), f"Unexpected output shape: {out.shape}"
 

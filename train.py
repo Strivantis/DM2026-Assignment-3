@@ -1,24 +1,25 @@
 """
 train.py
 --------
-End-to-end training pipeline for the HAR 1D-ResNet (v2).
+End-to-end training pipeline for the HAR 1D-ResNet (v3).
 
 Features
 ────────
+  • Deterministic seeding via seed_everything(42) for absolute reproducibility
   • 5-fold StratifiedGroupKFold cross-validation
   • Alpha-weighted Focal Loss  (γ=2.0, α=inverse-frequency weights)
   • AdamW optimiser (weight_decay=1e-3) + CosineAnnealingLR scheduler
-  • Early stopping monitored on Validation Macro F1-Score
+  • Early stopping monitored on Validation Macro F1-Score (patience=25)
   • Dual-stream logging: compressed single-line console + full-detail file log
   • Best checkpoint saved per fold as  fold_N_best.pth  (1-indexed)
   • Full classification report + confusion matrix at final CV summary
-  • Final predictions on the held-out test set → submission.csv
+  • Automated 5-fold Softmax Averaging Ensemble inference → submission_v3_ensemble.csv
 
 Usage
 ─────
     conda activate PyTorch
-    python train.py               # fold 0 only
-    python train.py --all-folds   # full 5-fold CV
+    python train.py               # fold 1 only
+    python train.py --all-folds   # full 5-fold CV + ensemble inference
 
 DO NOT run this script automatically – see task constraints.
 """
@@ -26,6 +27,7 @@ DO NOT run this script automatically – see task constraints.
 import os
 import sys
 import time
+import random
 import warnings
 import argparse
 
@@ -48,43 +50,74 @@ from model import ResNet1D
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 1: Deterministic Experimental Control
+# ══════════════════════════════════════════════════════════════════════════════
+
+def seed_everything(seed: int = 42) -> None:
+    """
+    Lock all random number generators for absolute experimental reproducibility.
+
+    Covers:
+      • Python built-in random module
+      • NumPy global RNG
+      • PyTorch CPU RNG
+      • PyTorch CUDA RNG (all devices)
+      • cuDNN deterministic execution mode (benchmark disabled)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+# Apply global seed immediately at module load time
+seed_everything(42)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 
 CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
-    "train_root"      : "./train/train",
-    "test_root"       : "./test/test",
-    "submission_path" : "./submission.csv",
-    "checkpoint_dir"  : "./checkpoints",
-    "log_path"        : "./training_log.txt",
+    "train_root"        : "./train/train",
+    "test_root"         : "./test/test",
+    "submission_path"   : "./submission_v3_ensemble.csv",
+    "checkpoint_dir"    : "./checkpoints",
+    "log_path"          : "./training_log.txt",
 
     # Training ────────────────────────────────────────────────────────────────
-    "epochs"          : 80,
-    "batch_size"      : 128,
-    "lr"              : 3e-4,
-    "weight_decay"    : 1e-3,       # v2: scaled up from 1e-4 → 1e-3
-    "num_workers"     : 4,
-    "pin_memory"      : True,
+    "epochs"            : 80,
+    "batch_size"        : 128,
+    "lr"                : 3e-4,
+    "weight_decay"      : 1e-3,
+    "num_workers"       : 4,
+    "pin_memory"        : True,
 
     # CosineAnnealingLR
-    "T_max"           : 80,
-    "eta_min"         : 1e-6,
+    "T_max"             : 80,
+    "eta_min"           : 1e-6,
 
     # Early stopping ──────────────────────────────────────────────────────────
-    "patience"        : 15,
+    "patience"          : 25,          # v3: expanded from 15 → 25
 
     # Model ───────────────────────────────────────────────────────────────────
-    "in_channels"     : 6,
-    "num_classes"     : 6,
-    "base_filters"    : 64,
+    "in_channels"       : 8,           # v3: 6 raw + 2 magnitude channels
+    "num_classes"       : 6,
+    "base_filters"      : 64,
 
     # Focal Loss ──────────────────────────────────────────────────────────────
-    "focal_gamma"     : 2.0,
+    "focal_gamma"       : 2.0,
 
     # Cross-validation ────────────────────────────────────────────────────────
-    "run_all_folds"   : False,
+    "run_all_folds"     : False,
+
+    # Reproducibility ─────────────────────────────────────────────────────────
+    "seed"              : 42,
 }
 
 
@@ -211,7 +244,7 @@ def build_focal_loss(class_counts: np.ndarray,
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EarlyStopping:
-    def __init__(self, patience: int = 15, min_delta: float = 1e-4,
+    def __init__(self, patience: int = 25, min_delta: float = 1e-4,
                  checkpoint_path: str = "best_model.pth"):
         self.patience        = patience
         self.min_delta       = min_delta
@@ -418,7 +451,110 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test-set inference (single checkpoint)
+# Softmax Averaging Ensemble inference (Module 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def ensemble_inference(fold_results: list, cfg: dict,
+                       device: torch.device,
+                       logger: DualLogger) -> pd.DataFrame:
+    """
+    Automated 5-fold Softmax Averaging Ensemble inference pipeline.
+
+    For every test sample:
+      1. Load saved best checkpoint for each fold (fold_1_best.pth … fold_5_best.pth).
+      2. Extract raw logits from each model.
+      3. Convert to per-class probability distributions via Softmax.
+      4. Average the 5 probability distributions (Softmax Averaging).
+      5. Apply argmax to obtain the ensemble final prediction.
+
+    Parameters
+    ----------
+    fold_results : list of (fold_idx, best_f1, norm_params, ckpt_path, report)
+                   The norm_params from the first fold entry are used to
+                   normalise the test set (consistent with the submission pipeline).
+    cfg          : dict – global config
+    device       : torch.device
+    logger       : DualLogger
+
+    Returns
+    -------
+    submission : pd.DataFrame with columns ['Id', 'Label'], sorted by Id
+    """
+    logger.log("\n" + "=" * 70)
+    logger.log("  AUTO-ENSEMBLE INFERENCE  (5-Fold Softmax Averaging)")
+    logger.log("=" * 70)
+
+    # Use the norm params from the first available fold to normalise test data.
+    # (All folds yield very similar norm params; fold 1 is the canonical choice.)
+    first_norm = fold_results[0][2]   # (mean, std)
+    test_ds, file_ids = build_test_dataset(cfg["test_root"], first_norm[0], first_norm[1])
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg["batch_size"] * 2,
+        shuffle=False,
+        num_workers=cfg["num_workers"],
+        pin_memory=cfg["pin_memory"],
+    )
+
+    n_test    = len(test_ds)
+    n_classes = cfg["num_classes"]
+
+    # Accumulator: sum of per-fold softmax probability vectors
+    prob_sum = np.zeros((n_test, n_classes), dtype=np.float64)
+
+    for fold_idx, best_f1, norm_params, ckpt_path, _ in fold_results:
+        fold_num = fold_idx + 1
+        logger.log(f"  Loading fold {fold_num} checkpoint: {ckpt_path}")
+
+        model = ResNet1D(
+            in_channels=cfg["in_channels"],
+            num_classes=cfg["num_classes"],
+            base_filters=cfg["base_filters"],
+        ).to(device)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.eval()
+
+        fold_probs = []
+        for signals, _ in test_loader:
+            logits = model(signals.to(device, non_blocking=True))          # (B, C)
+            probs  = F.softmax(logits, dim=1).cpu().numpy()                # (B, C)
+            fold_probs.append(probs)
+
+        fold_probs_arr = np.concatenate(fold_probs, axis=0)                # (N, C)
+        prob_sum      += fold_probs_arr
+
+        logger.log(f"    Fold {fold_num} probabilities accumulated  "
+                   f"(shape: {fold_probs_arr.shape})")
+
+    # Average the accumulated probability distributions
+    n_folds_run   = len(fold_results)
+    avg_probs     = prob_sum / n_folds_run                                 # (N, C)
+    ensemble_preds = avg_probs.argmax(axis=1)                              # (N,)
+
+    # Build submission DataFrame
+    submission = (
+        pd.DataFrame({"Id": file_ids, "Label": ensemble_preds})
+        .sort_values("Id")
+        .reset_index(drop=True)
+    )
+
+    # Save
+    submission.to_csv(cfg["submission_path"], index=False)
+
+    logger.log(f"\n  Ensemble folds used        : {n_folds_run}")
+    logger.log(f"  Total test samples         : {n_test}")
+    logger.log(f"  Submission saved to        : {cfg['submission_path']}")
+    pred_dist = submission["Label"].value_counts().sort_index()
+    logger.log("  Predicted label distribution on test set (ensemble):")
+    for lbl, cnt in pred_dist.items():
+        logger.log(f"    Label {lbl}: {cnt:>5d}  ({cnt / n_test * 100:.1f}%)")
+
+    return submission
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Test-set inference (single checkpoint) — retained for diagnostic use
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -466,7 +602,7 @@ def format_confusion_matrix(all_labels, all_preds) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v2")
+    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v3")
     parser.add_argument("--all-folds",  action="store_true")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
@@ -481,6 +617,9 @@ def main():
     CFG["patience"]      = args.patience
     CFG["T_max"]         = args.epochs
 
+    # Re-apply seed after any CLI arg mutations (belt-and-suspenders)
+    seed_everything(CFG["seed"])
+
     # ── Logger setup ──────────────────────────────────────────────────────────
     logger = DualLogger(CFG["log_path"])
 
@@ -489,7 +628,7 @@ def main():
 
     header_lines = [
         "=" * 70,
-        "  HAR 1D-ResNet Training Pipeline  (v2)",
+        "  HAR 1D-ResNet Training Pipeline  (v3)",
         "=" * 70,
         f"  Log file    : {os.path.abspath(CFG['log_path'])}",
         f"  Device      : {device}",
@@ -500,6 +639,8 @@ def main():
             f"  VRAM        : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
         ]
     header_lines += [
+        f"  Seed        : {CFG['seed']}  (deterministic=True, benchmark=False)",
+        f"  In channels : {CFG['in_channels']}  (6 raw + 2 magnitude)",
         f"  Epochs      : {CFG['epochs']}",
         f"  Batch       : {CFG['batch_size']}",
         f"  LR          : {CFG['lr']}",
@@ -558,27 +699,25 @@ def main():
         logger.log("\n--- Aggregate Confusion Matrix (all CV validation folds) ---")
         logger.log(cm_text)
 
-    # ── Best fold for test inference ──────────────────────────────────────────
-    best_entry = max(fold_results, key=lambda r: r[1])
-    best_fold_idx, best_f1, best_norm, best_ckpt, _ = best_entry
-    logger.log(f"\n  Using Fold {best_fold_idx+1} checkpoint "
-               f"(F1={best_f1:.6f}) for test inference.")
-
-    # ── Test inference ────────────────────────────────────────────────────────
-    logger.log("\n--- Test Inference ---")
-    submission = predict_test(best_ckpt, best_norm, CFG, device)
-    submission.to_csv(CFG["submission_path"], index=False)
-
-    logger.log(f"  Submission saved to : {CFG['submission_path']}")
-    logger.log(f"  Total test samples  : {len(submission)}")
-    pred_dist = submission["Label"].value_counts().sort_index()
-    logger.log("  Predicted label distribution on test set:")
-    for lbl, cnt in pred_dist.items():
-        logger.log(f"    Label {lbl}: {cnt:>5d}  ({cnt / len(submission) * 100:.1f}%)")
+    # ══════════════════════════════════════════════════════════════════════════
+    # Module 4: Automated 5-Fold Softmax Averaging Ensemble Inference
+    # ══════════════════════════════════════════════════════════════════════════
+    # This block executes automatically after the CV loop.
+    # It sequentially loads fold_1_best.pth … fold_N_best.pth (where N is the
+    # number of folds trained in this run), averages their Softmax distributions,
+    # and writes the final ensemble mapping to submission_v3_ensemble.csv.
+    # ──────────────────────────────────────────────────────────────────────────
+    if len(fold_results) > 0:
+        ensemble_submission = ensemble_inference(
+            fold_results=fold_results,
+            cfg=CFG,
+            device=device,
+            logger=logger,
+        )
 
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline complete. Submission file ready.")
-    logger.log("  For ensemble inference run: python inference.py --all-folds")
+    logger.log("  Pipeline v3 complete.")
+    logger.log(f"  Ensemble submission ready : {CFG['submission_path']}")
     logger.log("=" * 70)
 
     logger.close()
