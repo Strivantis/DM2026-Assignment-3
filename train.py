@@ -1,16 +1,16 @@
 """
 train.py
 --------
-End-to-end training pipeline for the HAR 1D-ResNet.
+End-to-end training pipeline for the HAR 1D-ResNet (v2).
 
 Features
 ────────
   • 5-fold StratifiedGroupKFold cross-validation
-  • Class-Weighted CrossEntropyLoss  (counters severe class imbalance)
-  • AdamW optimiser + CosineAnnealingLR scheduler
+  • Alpha-weighted Focal Loss  (γ=2.0, α=inverse-frequency weights)
+  • AdamW optimiser (weight_decay=1e-3) + CosineAnnealingLR scheduler
   • Early stopping monitored on Validation Macro F1-Score
   • Dual-stream logging: compressed single-line console + full-detail file log
-  • Best checkpoint saved per fold
+  • Best checkpoint saved per fold as  fold_N_best.pth  (1-indexed)
   • Full classification report + confusion matrix at final CV summary
   • Final predictions on the held-out test set → submission.csv
 
@@ -64,7 +64,7 @@ CFG = {
     "epochs"          : 80,
     "batch_size"      : 128,
     "lr"              : 3e-4,
-    "weight_decay"    : 1e-4,
+    "weight_decay"    : 1e-3,       # v2: scaled up from 1e-4 → 1e-3
     "num_workers"     : 4,
     "pin_memory"      : True,
 
@@ -79,6 +79,9 @@ CFG = {
     "in_channels"     : 6,
     "num_classes"     : 6,
     "base_filters"    : 64,
+
+    # Focal Loss ──────────────────────────────────────────────────────────────
+    "focal_gamma"     : 2.0,
 
     # Cross-validation ────────────────────────────────────────────────────────
     "run_all_folds"   : False,
@@ -97,7 +100,7 @@ class DualLogger:
     -------
     log(msg)         – write to BOTH console and file  (default for most output)
     log_file(msg)    – write to FILE only  (verbose per-epoch details, reports)
-    log_console(msg) – write to CONSOLE only  (transient status that is too noisy for file)
+    log_console(msg) – write to CONSOLE only  (transient status, noisy for file)
     close()          – flush and close the file handle
     """
 
@@ -131,21 +134,76 @@ class DualLogger:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Loss function
+# Focal Loss
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_class_weighted_loss(class_counts: np.ndarray,
-                              device: torch.device) -> nn.CrossEntropyLoss:
+class FocalLoss(nn.Module):
     """
-    Compute inverse-frequency class weights.
-    weight_c = total / (N_CLASSES × count_c),  then normalised so mean=1.
+    Alpha-weighted Focal Loss for multi-class classification.
+
+    FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
+
+    Parameters
+    ----------
+    alpha  : torch.Tensor, shape (num_classes,)
+             Per-class balancing weights (inverse-frequency, normalised).
+    gamma  : float  focusing parameter (default 2.0)
+    reduction : str  'mean' | 'sum' | 'none'
+    """
+
+    def __init__(self, alpha: torch.Tensor, gamma: float = 2.0,
+                 reduction: str = "mean"):
+        super().__init__()
+        self.register_buffer("alpha", alpha)   # (C,)
+        self.gamma     = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits  : (B, C)  raw model output (unnormalised)
+        targets : (B,)    integer class labels
+        """
+        # Standard cross-entropy per sample with class-weight α
+        # log_softmax is numerically stable
+        log_probs = F.log_softmax(logits, dim=1)              # (B, C)
+        probs     = log_probs.exp()                            # (B, C)
+
+        # Gather the log-prob and prob for the true class
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)   # (B,)
+        pt     = probs.gather(1, targets.unsqueeze(1)).squeeze(1)       # (B,)
+
+        # Focal modulating factor
+        focal_weight = (1.0 - pt) ** self.gamma                         # (B,)
+
+        # Per-class alpha weight for each sample
+        alpha_t = self.alpha.gather(0, targets)                         # (B,)
+
+        # Final per-sample loss
+        loss = -alpha_t * focal_weight * log_pt                         # (B,)
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+def build_focal_loss(class_counts: np.ndarray,
+                     device: torch.device,
+                     gamma: float = 2.0) -> FocalLoss:
+    """
+    Construct a FocalLoss with inverse-frequency alpha weights.
+
+    weight_c = total / (N_CLASSES × count_c),  then normalised so mean = 1.
     """
     counts  = class_counts.astype(np.float32)
     total   = counts.sum()
     weights = total / (N_CLASSES * counts)
     weights = weights / weights.mean()
-    weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
-    return nn.CrossEntropyLoss(weight=weight_tensor)
+    alpha   = torch.tensor(weights, dtype=torch.float32, device=device)
+    return FocalLoss(alpha=alpha, gamma=gamma)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -154,7 +212,7 @@ def build_class_weighted_loss(class_counts: np.ndarray,
 
 class EarlyStopping:
     def __init__(self, patience: int = 15, min_delta: float = 1e-4,
-                 checkpoint_path: str = "best_model.pt"):
+                 checkpoint_path: str = "best_model.pth"):
         self.patience        = patience
         self.min_delta       = min_delta
         self.checkpoint_path = checkpoint_path
@@ -231,12 +289,14 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
     best_val_report : str  – classification report text
     """
 
+    fold_num = fold_idx + 1   # 1-indexed for display
+
     # ── Console: clean single-line separator ──────────────────────────────────
-    logger.log(f"\n--- Fold {fold_idx + 1}/{N_FOLDS} Starting ---")
+    logger.log(f"\n--- Fold {fold_num}/{N_FOLDS} Starting ---")
 
     # ── File: verbose fold header ─────────────────────────────────────────────
     logger.log_file("=" * 70)
-    logger.log_file(f"FOLD {fold_idx + 1} / {N_FOLDS}  ──  Starting")
+    logger.log_file(f"FOLD {fold_num} / {N_FOLDS}  ──  Starting")
     logger.log_file("=" * 70)
 
     # ── Datasets ──────────────────────────────────────────────────────────────
@@ -270,12 +330,12 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
     logger.log_file(f"  Model: ResNet1D  |  Trainable params: {n_params:,}")
 
     # ── Loss ──────────────────────────────────────────────────────────────────
-    criterion = build_class_weighted_loss(class_counts, device)
-    counts  = class_counts.astype(np.float32)
-    weights = counts.sum() / (N_CLASSES * counts)
-    weights = weights / weights.mean()
-    logger.log_file("  Loss: Class-Weighted CrossEntropyLoss")
-    logger.log_file("  Effective class weights: " +
+    criterion = build_focal_loss(class_counts, device, gamma=cfg["focal_gamma"])
+    counts    = class_counts.astype(np.float32)
+    weights   = counts.sum() / (N_CLASSES * counts)
+    weights   = weights / weights.mean()
+    logger.log_file(f"  Loss: Focal Loss (γ={cfg['focal_gamma']}, α=inverse-frequency)")
+    logger.log_file("  Effective alpha weights: " +
                     "  ".join(f"L{c}:{w:.3f}" for c, w in enumerate(weights)))
 
     # ── Optimiser + Scheduler ─────────────────────────────────────────────────
@@ -286,7 +346,8 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
     # ── Early stopping ────────────────────────────────────────────────────────
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
-    ckpt_path  = os.path.join(cfg["checkpoint_dir"], f"fold{fold_idx}_best.pt")
+    # Checkpoint file uses 1-indexed fold number: fold_1_best.pth … fold_5_best.pth
+    ckpt_path  = os.path.join(cfg["checkpoint_dir"], f"fold_{fold_num}_best.pth")
     early_stop = EarlyStopping(patience=cfg["patience"], checkpoint_path=ckpt_path)
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -302,21 +363,22 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
         elapsed = time.time() - t_start
         lr_now  = scheduler.get_last_lr()[0]
 
-        # ── Console: single compact line ──────────────────────────────────────
-        star = " *" if val_f1 >= early_stop.best_score else "  "
+        # ── Console: single compact line matching required template ───────────
+        # Template: [Fold F/5] Ep X/80 | LR: X.Xe-X | Loss: T:X.XX / V:X.XX |
+        #           Val Acc: XX.XX% | Val F1: X.XXXX | Time: X.Xs
         logger.log_console(
-            f"[Fold {fold_idx+1}/{N_FOLDS}] Ep {epoch:>3}/{cfg['epochs']} | "
+            f"[Fold {fold_num}/{N_FOLDS}] Ep {epoch:>3}/{cfg['epochs']} | "
             f"LR: {lr_now:.1e} | "
-            f"Loss: T:{train_loss:.4f} / V:{val_loss:.4f} | "
-            f"Val Acc: {val_acc:6.2f}% | "
+            f"Loss: T:{train_loss:.2f} / V:{val_loss:.2f} | "
+            f"Val Acc: {val_acc:5.2f}% | "
             f"Val F1: {val_f1:.4f} | "
-            f"Time: {elapsed:.1f}s{star}"
+            f"Time: {elapsed:.1f}s"
         )
 
-        # ── File: same line PLUS extra detail on next lines ───────────────────
+        # ── File: same header with higher precision ───────────────────────────
         logger.log_file(
-            f"[Fold {fold_idx+1}/{N_FOLDS}] Ep {epoch:>3}/{cfg['epochs']} | "
-            f"LR: {lr_now:.1e} | "
+            f"[Fold {fold_num}/{N_FOLDS}] Ep {epoch:>3}/{cfg['epochs']} | "
+            f"LR: {lr_now:.4e} | "
             f"Loss: T:{train_loss:.6f} / V:{val_loss:.6f} | "
             f"Val Acc: {val_acc:.4f}% | "
             f"Val F1: {val_f1:.6f} | "
@@ -339,7 +401,7 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
     # ── Post-fold summary ─────────────────────────────────────────────────────
     fold_summary = (
-        f"--- Fold {fold_idx+1} done | "
+        f"--- Fold {fold_num} done | "
         f"Best Val Macro F1: {early_stop.best_score:.6f} "
         f"(epoch {early_stop.best_epoch}) ---"
     )
@@ -356,7 +418,7 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test-set inference
+# Test-set inference (single checkpoint)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -404,7 +466,7 @@ def format_confusion_matrix(all_labels, all_preds) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline")
+    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v2")
     parser.add_argument("--all-folds",  action="store_true")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
@@ -427,22 +489,24 @@ def main():
 
     header_lines = [
         "=" * 70,
-        "  HAR 1D-ResNet Training Pipeline",
+        "  HAR 1D-ResNet Training Pipeline  (v2)",
         "=" * 70,
-        f"  Log file : {os.path.abspath(CFG['log_path'])}",
-        f"  Device   : {device}",
+        f"  Log file    : {os.path.abspath(CFG['log_path'])}",
+        f"  Device      : {device}",
     ]
     if device.type == "cuda":
         header_lines += [
-            f"  GPU      : {torch.cuda.get_device_name(0)}",
-            f"  VRAM     : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
+            f"  GPU         : {torch.cuda.get_device_name(0)}",
+            f"  VRAM        : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
         ]
     header_lines += [
-        f"  Epochs   : {CFG['epochs']}",
-        f"  Batch    : {CFG['batch_size']}",
-        f"  LR       : {CFG['lr']}",
-        f"  Patience : {CFG['patience']}",
-        f"  Folds    : {'all 5' if CFG['run_all_folds'] else 'fold 0 only'}",
+        f"  Epochs      : {CFG['epochs']}",
+        f"  Batch       : {CFG['batch_size']}",
+        f"  LR          : {CFG['lr']}",
+        f"  Weight Decay: {CFG['weight_decay']}",
+        f"  Focal γ     : {CFG['focal_gamma']}",
+        f"  Patience    : {CFG['patience']}",
+        f"  Folds       : {'all 5' if CFG['run_all_folds'] else 'fold 1 only'}",
         "=" * 70,
     ]
     for line in header_lines:
@@ -478,17 +542,20 @@ def main():
     logger.log(f"\n  Mean F1 = {np.mean(f1_scores):.6f}  ±  {np.std(f1_scores):.6f}")
     logger.log(f"  Total wall-clock time: {t_total / 60:.1f} min")
 
-    # ── Per-fold classification reports → console + file at summary stage ─────
+    # ── Per-fold classification reports → file only ───────────────────────────
     if len(fold_results) > 0:
-        logger.log("\n--- Per-Fold Classification Reports (Best Epoch) ---")
+        logger.log_file("\n--- Per-Fold Classification Reports (Best Epoch) ---")
         for fi, best_f1, _, _, report in fold_results:
-            logger.log(f"\n[Fold {fi+1}]  Val Macro F1 = {best_f1:.6f}")
-            logger.log(report)
+            logger.log_file(f"\n[Fold {fi+1}]  Val Macro F1 = {best_f1:.6f}")
+            logger.log_file(report)
 
-    # ── Aggregate confusion matrix ────────────────────────────────────────────
+    # ── Aggregate confusion matrix → file only ────────────────────────────────
     if len(all_fold_labels) > 0:
-        logger.log("\n--- Aggregate Confusion Matrix (all CV validation folds) ---")
         cm_text = format_confusion_matrix(all_fold_labels, all_fold_preds)
+        logger.log_file("\n--- Aggregate Confusion Matrix (all CV validation folds) ---")
+        logger.log_file(cm_text)
+        # Also surface summary to console
+        logger.log("\n--- Aggregate Confusion Matrix (all CV validation folds) ---")
         logger.log(cm_text)
 
     # ── Best fold for test inference ──────────────────────────────────────────
@@ -511,6 +578,7 @@ def main():
 
     logger.log("\n" + "=" * 70)
     logger.log("  Pipeline complete. Submission file ready.")
+    logger.log("  For ensemble inference run: python inference.py --all-folds")
     logger.log("=" * 70)
 
     logger.close()

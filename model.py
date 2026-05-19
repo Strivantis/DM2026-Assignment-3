@@ -11,9 +11,17 @@ Architecture outline
   Stem:  Conv1d(6→64, k=11, s=2) → BN → ReLU → MaxPool(k=3, s=2)
   Stage 1: ResBlock(64→64)  × 2
   Stage 2: ResBlock(64→128) × 2  [stride-2 downsample]
+  Spatial Dropout1d(p=0.2)        ← inserted between Stage 2 and Stage 3
   Stage 3: ResBlock(128→256)× 2  [stride-2 downsample]
   Stage 4: ResBlock(256→512)× 2  [stride-2 downsample]
-  Head:  Global Average Pooling → FC(512→6)
+  Head:  Global Average Pooling → Dropout(p=0.5) → FC(512→6)
+
+Regularisation changes (v2)
+───────────────────────────
+  • Spatial Dropout1d(p=0.2) between Stage 2 and Stage 3 drops entire
+    feature-map channels to discourage channel co-adaptation.
+  • Classifier head dropout increased from p=0.3 → p=0.5 for stronger
+    regularisation before the final linear projection.
 
 Total parameters: ~3.5 M  (fits comfortably in 8 GB VRAM even with large batches)
 """
@@ -117,6 +125,12 @@ class ResNet1D(nn.Module):
             ResBlock1D(f * 2, f * 2, stride=1),
         )                                                                  # L: 38
 
+        # Spatial Dropout between Stage 2 and Stage 3.
+        # nn.Dropout1d zeros entire channels (feature maps) along the temporal
+        # dimension, providing stronger regularisation than element-wise dropout
+        # and preventing the model from over-relying on any single feature map.
+        self.spatial_dropout = nn.Dropout1d(p=0.2)
+
         # Stage 3 – double channels, halve length, 2 blocks
         self.stage3 = nn.Sequential(
             ResBlock1D(f * 2, f * 4, stride=2),
@@ -133,8 +147,9 @@ class ResNet1D(nn.Module):
         # Global Average Pooling: collapses temporal dimension → (B, f*8)
         self.gap = nn.AdaptiveAvgPool1d(1)
 
-        # Optional lightweight dropout before the classifier
-        self.dropout = nn.Dropout(p=0.3)
+        # Increased dropout probability p=0.5 (was p=0.3) before the classifier
+        # to apply stronger regularisation and reduce over-fitting on training subjects.
+        self.dropout = nn.Dropout(p=0.5)
 
         # Final fully-connected classifier
         self.fc = nn.Linear(f * 8, num_classes)
@@ -166,15 +181,16 @@ class ResNet1D(nn.Module):
         -------
         logits : torch.Tensor, shape (B, num_classes)
         """
-        x = self.stem(x)     # (B, 64, 75)
-        x = self.stage1(x)   # (B, 64, 75)
-        x = self.stage2(x)   # (B, 128, 38)
-        x = self.stage3(x)   # (B, 256, 19)
-        x = self.stage4(x)   # (B, 512, 10)
-        x = self.gap(x)      # (B, 512, 1)
-        x = x.squeeze(-1)    # (B, 512)
-        x = self.dropout(x)
-        x = self.fc(x)       # (B, 6)
+        x = self.stem(x)             # (B, 64,  75)
+        x = self.stage1(x)           # (B, 64,  75)
+        x = self.stage2(x)           # (B, 128, 38)
+        x = self.spatial_dropout(x)  # (B, 128, 38) – drop whole channels
+        x = self.stage3(x)           # (B, 256, 19)
+        x = self.stage4(x)           # (B, 512, 10)
+        x = self.gap(x)              # (B, 512,  1)
+        x = x.squeeze(-1)            # (B, 512)
+        x = self.dropout(x)          # (B, 512) – p=0.5
+        x = self.fc(x)               # (B, 6)
         return x
 
 

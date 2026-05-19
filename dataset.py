@@ -9,6 +9,18 @@ Data format:
   - Feature shape after loading: (300, 6)  →  transposed to (6, 300) for 1D-CNN
   - Train users: User_001 – User_060
   - Test  users: User_061 – User_100
+
+Augmentation (v2)
+-----------------
+  Applied to ALL training samples (global, not minority-only) with probability
+  AUG_PROB per technique to prevent subject-signature memorisation:
+
+  • Time Masking (Cutout 1D)  – zero out a random window of 15-30 time-steps
+  • Channel Masking (Sensor Dropout) – zero out 1–2 random feature channels
+  • Jitter                    – add Gaussian noise
+  • Scale                     – multiply by per-channel random scalar
+
+  All augmentations are disabled during validation and testing.
 """
 
 import os
@@ -28,8 +40,17 @@ SEQ_LEN      = 300
 N_CLASSES    = 6
 N_FOLDS      = 5
 
-# Labels for which augmentation is applied during training
-MINORITY_LABELS = {2, 3, 4, 5}
+# ── Augmentation hyper-parameters ─────────────────────────────────────────────
+# Global execution probability: each augmentation technique fires independently
+AUG_PROB            = 0.5
+
+# Time masking (Cutout 1D)
+TIME_MASK_MIN       = 15   # minimum masked window length (time steps)
+TIME_MASK_MAX       = 30   # maximum masked window length (time steps)
+
+# Channel masking (Sensor Dropout)
+CHANNEL_MASK_MIN    = 1    # minimum number of channels to zero out
+CHANNEL_MASK_MAX    = 2    # maximum number of channels to zero out
 
 # Jitter noise std and scale range
 JITTER_SIGMA = 0.05
@@ -153,10 +174,65 @@ def augment_scale(signal: np.ndarray) -> np.ndarray:
     return signal * scale
 
 
+def augment_time_masking(signal: np.ndarray) -> np.ndarray:
+    """
+    Cutout 1D – zero out a contiguous window of TIME_MASK_MIN to TIME_MASK_MAX
+    time steps chosen uniformly at random.
+
+    Parameters
+    ----------
+    signal : np.ndarray, shape (300, 6)
+
+    Returns
+    -------
+    augmented signal : np.ndarray, shape (300, 6)
+    """
+    signal = signal.copy()
+    mask_len   = np.random.randint(TIME_MASK_MIN, TIME_MASK_MAX + 1)
+    start      = np.random.randint(0, SEQ_LEN - mask_len + 1)
+    signal[start : start + mask_len, :] = 0.0
+    return signal
+
+
+def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
+    """
+    Sensor Dropout – zero out CHANNEL_MASK_MIN to CHANNEL_MASK_MAX feature
+    channels chosen uniformly at random (without replacement).
+
+    Parameters
+    ----------
+    signal : np.ndarray, shape (300, 6)
+
+    Returns
+    -------
+    augmented signal : np.ndarray, shape (300, 6)
+    """
+    signal       = signal.copy()
+    n_mask       = np.random.randint(CHANNEL_MASK_MIN, CHANNEL_MASK_MAX + 1)
+    channels     = np.random.choice(N_CHANNELS, size=n_mask, replace=False)
+    signal[:, channels] = 0.0
+    return signal
+
+
 def apply_augmentation(signal: np.ndarray) -> np.ndarray:
-    """Apply all augmentations sequentially. signal: (300, 6)"""
-    signal = augment_jitter(signal)
-    signal = augment_scale(signal)
+    """
+    Apply all augmentations independently with probability AUG_PROB each.
+    Operates on signal of shape (300, 6) and returns the same shape.
+
+    Augmentation order:
+      1. Time Masking  (Cutout 1D)
+      2. Channel Masking (Sensor Dropout)
+      3. Jitter
+      4. Scale
+    """
+    if np.random.rand() < AUG_PROB:
+        signal = augment_time_masking(signal)
+    if np.random.rand() < AUG_PROB:
+        signal = augment_channel_masking(signal)
+    if np.random.rand() < AUG_PROB:
+        signal = augment_jitter(signal)
+    if np.random.rand() < AUG_PROB:
+        signal = augment_scale(signal)
     return signal
 
 
@@ -172,7 +248,7 @@ class HARDataset(Dataset):
     ----------
     signals    : np.ndarray, shape (N, 300, 6)  – already normalised
     labels     : np.ndarray, shape (N,)
-    is_train   : bool  – enables augmentation for minority classes
+    is_train   : bool  – enables global augmentation for ALL classes during training
     """
 
     def __init__(self, signals: np.ndarray, labels: np.ndarray, is_train: bool = False):
@@ -187,8 +263,10 @@ class HARDataset(Dataset):
         signal = self.signals[idx].copy()   # (300, 6)
         label  = self.labels[idx]
 
-        # Apply augmentation ONLY during training AND for minority-class samples
-        if self.is_train and int(label) in MINORITY_LABELS:
+        # Apply augmentation during training for ALL classes (global augmentation).
+        # Individual techniques fire stochastically at probability AUG_PROB each,
+        # preventing the model from memorising majority-class subject signatures.
+        if self.is_train:
             signal = apply_augmentation(signal)
 
         # Transpose: (300, 6)  →  (6, 300)  for 1D-CNN input (C, L)
@@ -229,7 +307,7 @@ def build_fold_datasets(train_root: str, fold_idx: int = 0):
 
     Returns
     -------
-    train_dataset : HARDataset  (augmentation ON for minority classes)
+    train_dataset : HARDataset  (global augmentation ON for all classes)
     val_dataset   : HARDataset  (no augmentation)
     norm_params   : (mean, std) tuple – derived from training fold only
     class_counts  : np.ndarray, shape (N_CLASSES,) – for loss weighting
