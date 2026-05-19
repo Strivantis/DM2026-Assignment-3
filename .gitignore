@@ -1,2 +1,5 @@
 test/*
 train/*
+*.md
+*.csv
+*.txt

@@ -10,7 +10,7 @@ from tqdm import tqdm
 # 參數設定 (請修改為你的實際路徑)
 # ==========================================
 TRAIN_DIR = './train/train'  # 包含 User_001-060 的資料夾
-TEST_DIR = './data/data'     # 包含 User_061-100 的資料夾
+TEST_DIR = './test/test'     # 包含 User_061-100 的資料夾
 
 def run_eda():
     print("🚀 啟動資料探勘與預處理分析...\n")
