@@ -6,37 +6,47 @@ for the HAR 1D-ResNet project.
 
 Data format:
   - Each CSV: 300 rows × columns [index, mean_x, mean_y, mean_z, std_x, std_y, std_z, label, file_id]
-  - Raw feature shape after loading: (300, 6)
-  - Magnitude features appended: (300, 8)
-  - Delta (first-derivative) features appended: (300, 16)  →  transposed to (16, 300) for 1D-CNN
+  - Raw feature shape after loading:  (300, 6)
+  - Pruned + magnitude channel:       (300, 4)  →  transposed to (4, 300) for 1D-CNN
   - Train users: User_001 – User_060
   - Test  users: User_061 – User_100
 
-Feature Engineering (v4)
--------------------------
-  Two rotation-invariant magnitude channels are appended after the raw 6-channel
-  features, then 8 first-order temporal delta channels are appended to capture
-  short-term dynamics:
+Feature Engineering (v6 — Radical Pruning)
+--------------------------------------------
+  Multicollinear std_x / std_y / std_z axes are dropped entirely to resolve
+  extreme weight-thrashing in the 1D-CNN layers.  The synthesised mean_mag
+  feature is also dropped (low importance, redundant with raw axes).  Only the
+  four highest-signal channels are retained:
 
-  • mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)
-  • std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)
+   Pruned Channel Map (4 channels):
+     [0] mean_x   – raw X-axis sliding-window mean
+     [1] mean_y   – raw Y-axis sliding-window mean
+     [2] mean_z   – raw Z-axis sliding-window mean
+     [3] std_mag  = sqrt(std_x² + std_y² + std_z² + 1e-8)
+                    holistic dynamic-motion energy (rotation-invariant)
 
-  Delta channels (first-order temporal derivative over sequence length 300):
-    X'_t = X_t − X_{t−1}    for t ≥ 1
-    X'_0 = 0                 (zero-padding at the initial boundary)
+  Final output shape per sample: (4, 300).
 
-  Final channel layout (16 channels):
-    ── Base channels (0–7) ──────────────────────────────────────
-    [0] mean_x   [1] mean_y   [2] mean_z
-    [3] std_x    [4] std_y    [5] std_z
-    [6] mean_mag [7] std_mag
-    ── Delta channels (8–15) ────────────────────────────────────
-    [8]  Δmean_x   [9]  Δmean_y   [10] Δmean_z
-    [11] Δstd_x    [12] Δstd_y    [13] Δstd_z
-    [14] Δmean_mag [15] Δstd_mag
+Instance-Level Mean Centering for Pose Elimination (v6)
+---------------------------------------------------------
+  To eradicate device-wearing orientation bias (user-to-user covariate shift),
+  per-sample temporal mean centering is applied to the three directional axes
+  (channels 0–2) BEFORE global Z-score normalization:
 
-Augmentation (v3, unchanged in v4)
------------------------------------
+      X_ch ← X_ch - mean(X_ch)    for ch ∈ {mean_x, mean_y, mean_z}
+
+  std_mag (channel 3) is deliberately excluded — its absolute vibration
+  magnitude must be preserved for correct dynamic-motion representation.
+
+  Execution order:
+    1. Load raw (N, 300, 6) array
+    2. Compute std_mag, prune to (N, 300, 4)
+    3. Apply instance mean centering to channels 0–2   ← NEW (v6)
+    4. Compute per-fold Z-score statistics (training fold only)
+    5. Apply global Z-score normalisation
+
+Augmentation (v3/v5, unchanged)
+---------------------------------
   Applied to ALL training samples (global, not minority-only) with probability
   AUG_PROB per technique to prevent subject-signature memorisation.
 
@@ -65,9 +75,8 @@ from sklearn.model_selection import StratifiedGroupKFold
 # Constants
 # ──────────────────────────────────────────
 FEATURE_COLS  = ["mean_x", "mean_y", "mean_z", "std_x", "std_y", "std_z"]
-RAW_CHANNELS  = len(FEATURE_COLS)   # 6  (original sensor channels)
-BASE_CHANNELS = 8                   # 6 raw + 2 magnitude channels
-N_CHANNELS    = 16                  # 8 base + 8 delta channels (v4)
+RAW_CHANNELS  = len(FEATURE_COLS)   # 6  (original sensor columns in CSV)
+N_CHANNELS    = 4                   # v6: 4 pruned channels (mean_x/y/z + std_mag)
 SEQ_LEN       = 300
 N_CLASSES     = 6
 N_FOLDS       = 5
@@ -94,12 +103,16 @@ PROTECTED_LABEL = 2
 
 
 # ──────────────────────────────────────────
-# Magnitude feature engineering
+# Pruned feature engineering  (v6)
 # ──────────────────────────────────────────
 
-def append_magnitude_channels(sig: np.ndarray) -> np.ndarray:
+def build_pruned_channels(sig: np.ndarray) -> np.ndarray:
     """
-    Append two rotation-invariant magnitude channels to the raw feature matrix.
+    Construct the 4-channel pruned feature matrix from the raw 6-channel input.
+
+    Drops std_x, std_y, std_z (multicollinear, correlation 0.93–0.98) and
+    mean_mag (low importance).  Retains mean_x/y/z (raw directional signal)
+    plus std_mag (rotation-invariant motion-energy scalar).
 
     Parameters
     ----------
@@ -108,55 +121,54 @@ def append_magnitude_channels(sig: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    sig_aug : np.ndarray, shape (300, 8)
-              Columns: [mean_x, mean_y, mean_z, std_x, std_y, std_z,
-                        mean_mag, std_mag]
+    out : np.ndarray, shape (300, 4)
+          Columns: [mean_x, mean_y, mean_z, std_mag]
     """
     mean_x, mean_y, mean_z = sig[:, 0], sig[:, 1], sig[:, 2]
     std_x,  std_y,  std_z  = sig[:, 3], sig[:, 4], sig[:, 5]
 
-    mean_mag = np.sqrt(mean_x ** 2 + mean_y ** 2 + mean_z ** 2 + 1e-8).astype(np.float32)
-    std_mag  = np.sqrt(std_x  ** 2 + std_y  ** 2 + std_z  ** 2 + 1e-8).astype(np.float32)
+    std_mag = np.sqrt(std_x ** 2 + std_y ** 2 + std_z ** 2 + 1e-8).astype(np.float32)
+    std_mag = std_mag[:, np.newaxis]   # (300, 1)
 
-    # Expand dims for concatenation: (300,) → (300, 1)
-    mean_mag = mean_mag[:, np.newaxis]
-    std_mag  = std_mag[:, np.newaxis]
-
-    return np.concatenate([sig, mean_mag, std_mag], axis=1)   # (300, 8)
+    # Stack: mean_x / mean_y / mean_z already in sig[:, 0:3]
+    out = np.concatenate([sig[:, 0:3], std_mag], axis=1)   # (300, 4)
+    return out
 
 
 # ──────────────────────────────────────────
-# Delta (first-derivative) feature engineering  [v4]
+# Instance-level mean centering  (v6)
 # ──────────────────────────────────────────
 
-def append_delta_channels(sig: np.ndarray) -> np.ndarray:
+def apply_instance_centering(signals: np.ndarray) -> np.ndarray:
     """
-    Append first-order temporal derivative (delta) channels for all 8 base
-    channels, expanding the feature matrix from 8 to 16 channels.
+    Apply sample-wise temporal mean centering to the three directional axes
+    (channels 0–2: mean_x, mean_y, mean_z) to eradicate device-placement
+    orientation bias across users.
 
-    Delta computation:
-        X'_t = X_t − X_{t−1}   for t ≥ 1
-        X'_0 = 0                (zero-padding at the initial boundary condition)
+    For every individual 300-timestep sequence X:
+        X[:, ch] ← X[:, ch] - mean(X[:, ch])    for ch in {0, 1, 2}
 
-    The sequential length of 300 is strictly preserved.
+    Channel 3 (std_mag) is INTENTIONALLY EXCLUDED — its absolute vibration
+    magnitude must be preserved for correct dynamic-motion representation.
+
+    This centering is executed BEFORE global Z-score normalization so that
+    fold-level statistics are computed on orientation-corrected signals.
 
     Parameters
     ----------
-    sig : np.ndarray, shape (300, 8)
-          Base channels: [mean_x, mean_y, mean_z, std_x, std_y, std_z,
-                          mean_mag, std_mag]
+    signals : np.ndarray, shape (N, 300, 4)
+              Raw pruned feature arrays (not yet normalised).
 
     Returns
     -------
-    sig_with_deltas : np.ndarray, shape (300, 16)
-          Channels 0–7  : original base channels
-          Channels 8–15 : corresponding first-order delta channels
+    centered : np.ndarray, shape (N, 300, 4)
+               Channels 0–2 centered per-sample; channel 3 unchanged.
     """
-    # delta[0] = 0 (boundary condition), delta[t] = sig[t] - sig[t-1] for t >= 1
-    delta = np.zeros_like(sig)            # (300, 8), dtype inherited from sig
-    delta[1:, :] = sig[1:, :] - sig[:-1, :]   # shape (299, 8)
-
-    return np.concatenate([sig, delta], axis=1)   # (300, 16)
+    centered = signals.copy()
+    # Center channels 0, 1, 2 independently for each sample
+    # mean over 300 timesteps: axis=1 → shape (N, 1) after keepdims
+    centered[:, :, 0:3] -= centered[:, :, 0:3].mean(axis=1, keepdims=True)
+    return centered
 
 
 # ──────────────────────────────────────────
@@ -169,10 +181,11 @@ def load_all_samples(root_dir: str):
 
     Returns
     -------
-    signals : np.ndarray, shape (N, 300, 16)  – 8 base + 8 delta channels
-    labels  : np.ndarray, shape (N,)   – integer class index
-    groups  : np.ndarray, shape (N,)   – integer user id (for GroupKFold)
-    file_ids: np.ndarray, shape (N,)   – original file_id value (for submission)
+    signals  : np.ndarray, shape (N, 300, 4)  – pruned 4-channel feature array
+                                                 (NOT yet instance-centred or normalised)
+    labels   : np.ndarray, shape (N,)          – integer class index
+    groups   : np.ndarray, shape (N,)          – integer user id (for GroupKFold)
+    file_ids : np.ndarray, shape (N,)          – original file_id value (for submission)
     """
     csv_files = sorted(glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True))
     if len(csv_files) == 0:
@@ -191,15 +204,10 @@ def load_all_samples(root_dir: str):
         assert sig_raw.shape == (SEQ_LEN, RAW_CHANNELS), \
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
-        # --- append magnitude channels → (300, 8)
-        sig_base = append_magnitude_channels(sig_raw)
-        assert sig_base.shape == (SEQ_LEN, BASE_CHANNELS), \
-            f"Unexpected post-magnitude shape {sig_base.shape} for file {path}"
-
-        # --- append delta channels → (300, 16)  [v4]
-        sig = append_delta_channels(sig_base)
+        # --- prune to 4-channel representation: [mean_x, mean_y, mean_z, std_mag]
+        sig = build_pruned_channels(sig_raw)          # (300, 4)
         assert sig.shape == (SEQ_LEN, N_CHANNELS), \
-            f"Unexpected post-delta shape {sig.shape} for file {path}"
+            f"Unexpected post-pruning shape {sig.shape} for file {path}"
 
         # --- label (one label per file, guaranteed consistent)
         lbl = int(df["label"].iloc[0])
@@ -217,7 +225,7 @@ def load_all_samples(root_dir: str):
         groups_list.append(user_id)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 16)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 4)
     labels   = np.array(labels_list,   dtype=np.int64)
     groups   = np.array(groups_list,   dtype=np.int64)
     file_ids = np.array(file_ids_list, dtype=np.int64)
@@ -231,14 +239,14 @@ def compute_normalization_params(signals: np.ndarray):
 
     Parameters
     ----------
-    signals : np.ndarray, shape (N, 300, 16)
+    signals : np.ndarray, shape (N, 300, 4)
 
     Returns
     -------
-    mean : np.ndarray, shape (16,)
-    std  : np.ndarray, shape (16,)
+    mean : np.ndarray, shape (4,)
+    std  : np.ndarray, shape (4,)
     """
-    # Reshape to (N*300, 16) then compute stats along axis 0
+    # Reshape to (N*300, 4) then compute stats along axis 0
     flat = signals.reshape(-1, N_CHANNELS)
     mean = flat.mean(axis=0).astype(np.float32)
     std  = flat.std(axis=0).astype(np.float32)
@@ -249,7 +257,7 @@ def compute_normalization_params(signals: np.ndarray):
 def normalize(signals: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """
     Apply Z-score normalization using *pre-computed* mean/std.
-    signals : (N, 300, 16)  →  returns (N, 300, 16)
+    signals : (N, 300, 4)  →  returns (N, 300, 4)
     """
     return (signals - mean[np.newaxis, np.newaxis, :]) / std[np.newaxis, np.newaxis, :]
 
@@ -274,13 +282,13 @@ def get_fold_splits(signals, labels, groups, fold_idx: int = 0):
 # ──────────────────────────────────────────
 
 def augment_jitter(signal: np.ndarray) -> np.ndarray:
-    """Add Gaussian noise to simulate sensor variance. signal: (300, 16)"""
+    """Add Gaussian noise to simulate sensor variance. signal: (300, 4)"""
     noise = np.random.normal(0.0, JITTER_SIGMA, size=signal.shape).astype(np.float32)
     return signal + noise
 
 
 def augment_scale(signal: np.ndarray) -> np.ndarray:
-    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 16)"""
+    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 4)"""
     scale = np.random.uniform(SCALE_LOW, SCALE_HIGH, size=(1, N_CHANNELS)).astype(np.float32)
     return signal * scale
 
@@ -292,11 +300,11 @@ def augment_time_masking(signal: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    signal : np.ndarray, shape (300, 16)
+    signal : np.ndarray, shape (300, 4)
 
     Returns
     -------
-    augmented signal : np.ndarray, shape (300, 16)
+    augmented signal : np.ndarray, shape (300, 4)
     """
     signal = signal.copy()
     mask_len   = np.random.randint(TIME_MASK_MIN, TIME_MASK_MAX + 1)
@@ -312,11 +320,11 @@ def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    signal : np.ndarray, shape (300, 16)
+    signal : np.ndarray, shape (300, 4)
 
     Returns
     -------
-    augmented signal : np.ndarray, shape (300, 16)
+    augmented signal : np.ndarray, shape (300, 4)
     """
     signal       = signal.copy()
     n_mask       = np.random.randint(CHANNEL_MASK_MIN, CHANNEL_MASK_MAX + 1)
@@ -328,9 +336,9 @@ def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
 def apply_augmentation(signal: np.ndarray, label: int) -> np.ndarray:
     """
     Apply all augmentations independently with probability AUG_PROB each.
-    Operates on signal of shape (300, 16) and returns the same shape.
+    Operates on signal of shape (300, 4) and returns the same shape.
 
-    Protected Exemption (v3):
+    Protected Exemption (v3/v5/v6):
       If label == PROTECTED_LABEL (2), Time Masking (Cutout 1D) is
       strictly skipped to preserve critical low-frequency structural signals
       that differentiate Label 2 from Label 1.
@@ -365,13 +373,13 @@ class HARDataset(Dataset):
 
     Parameters
     ----------
-    signals    : np.ndarray, shape (N, 300, 16)  – already normalised
+    signals    : np.ndarray, shape (N, 300, 4)  – already instance-centred and normalised
     labels     : np.ndarray, shape (N,)
     is_train   : bool  – enables global augmentation for ALL classes during training
     """
 
     def __init__(self, signals: np.ndarray, labels: np.ndarray, is_train: bool = False):
-        self.signals  = signals.astype(np.float32)  # (N, 300, 16)
+        self.signals  = signals.astype(np.float32)  # (N, 300, 4)
         self.labels   = labels.astype(np.int64)
         self.is_train = is_train
 
@@ -379,7 +387,7 @@ class HARDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].copy()   # (300, 16)
+        signal = self.signals[idx].copy()   # (300, 4)
         label  = self.labels[idx]
 
         # Apply augmentation during training for ALL classes (global augmentation).
@@ -389,8 +397,8 @@ class HARDataset(Dataset):
         if self.is_train:
             signal = apply_augmentation(signal, int(label))
 
-        # Transpose: (300, 16)  →  (16, 300)  for 1D-CNN input (C, L)
-        signal = signal.T  # (16, 300)
+        # Transpose: (300, 4)  →  (4, 300)  for 1D-CNN input (C, L)
+        signal = signal.T  # (4, 300)
 
         return torch.from_numpy(signal), torch.tensor(label, dtype=torch.long)
 
@@ -401,7 +409,7 @@ class HARTestDataset(Dataset):
 
     Parameters
     ----------
-    signals  : np.ndarray, shape (N, 300, 16)  – already normalised
+    signals  : np.ndarray, shape (N, 300, 4)  – already instance-centred and normalised
     file_ids : np.ndarray, shape (N,)           – for submission mapping
     """
 
@@ -413,7 +421,7 @@ class HARTestDataset(Dataset):
         return len(self.signals)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].T.copy()   # (16, 300)
+        signal = self.signals[idx].T.copy()   # (4, 300)
         return torch.from_numpy(signal), self.file_ids[idx]
 
 
@@ -425,6 +433,12 @@ def build_fold_datasets(train_root: str, fold_idx: int = 0):
     """
     Full pipeline for one CV fold.
 
+    Processing order (v6):
+      1. Load raw feature arrays → (N, 300, 4)  [mean_x, mean_y, mean_z, std_mag]
+      2. Apply instance mean centering to channels 0–2 per sample (BEFORE global stats)
+      3. Compute per-fold Z-score statistics from training fold only  (no leakage)
+      4. Apply global Z-score normalisation to train and validation splits
+
     Returns
     -------
     train_dataset : HARDataset  (global augmentation ON, with L2 time-mask protection)
@@ -435,6 +449,12 @@ def build_fold_datasets(train_root: str, fold_idx: int = 0):
     signals, labels, groups, _ = load_all_samples(train_root)
 
     train_idx, val_idx = get_fold_splits(signals, labels, groups, fold_idx)
+
+    # ── v6: Instance mean centering BEFORE global Z-score statistics ──────────
+    # Apply per-sample centering on the full signal array (both splits).
+    # This ensures fold-level normalization statistics are computed on
+    # orientation-corrected data.
+    signals = apply_instance_centering(signals)
 
     # Compute normalisation from training fold only → no leakage
     mean, std = compute_normalization_params(signals[train_idx])
@@ -461,7 +481,8 @@ def load_test_samples(root_dir: str):
 
     Returns
     -------
-    signals  : np.ndarray, shape (N, 300, 16)  – 8 base + 8 delta channels
+    signals  : np.ndarray, shape (N, 300, 4)  – pruned 4-channel array
+                                                 (NOT yet instance-centred or normalised)
     file_ids : np.ndarray, shape (N,)
     """
     csv_files = sorted(glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True))
@@ -478,18 +499,15 @@ def load_test_samples(root_dir: str):
         assert sig_raw.shape == (SEQ_LEN, RAW_CHANNELS), \
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
-        # Append magnitude channels → (300, 8)
-        sig_base = append_magnitude_channels(sig_raw)
-
-        # Append delta channels → (300, 16)  [v4]
-        sig = append_delta_channels(sig_base)
+        # Prune to 4-channel representation
+        sig = build_pruned_channels(sig_raw)   # (300, 4)
 
         file_id = int(df["file_id"].iloc[0])
 
         signals_list.append(sig)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 16)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 4)
     file_ids = np.array(file_ids_list, dtype=np.int64)
 
     return signals, file_ids
@@ -499,11 +517,20 @@ def build_test_dataset(test_root: str, norm_mean: np.ndarray, norm_std: np.ndarr
     """
     Build the test dataset using normalisation parameters from the training fold.
 
+    Processing order (v6):
+      1. Load raw test signals → (N, 300, 4)
+      2. Apply instance mean centering to channels 0–2 (mirrors training pipeline)
+      3. Apply global Z-score normalisation using fold-derived mean/std
+
     Returns
     -------
     test_dataset : HARTestDataset
     file_ids     : np.ndarray
     """
     signals, file_ids = load_test_samples(test_root)
+
+    # ── v6: Instance mean centering BEFORE global normalisation ──────────────
+    signals = apply_instance_centering(signals)
+
     test_signals = normalize(signals, norm_mean, norm_std)
     return HARTestDataset(test_signals, file_ids), file_ids

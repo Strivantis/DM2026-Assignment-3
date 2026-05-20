@@ -1,28 +1,28 @@
 """
 train.py
 --------
-End-to-end training pipeline for the HAR 1D-ResNet (v4).
+End-to-end training pipeline for the HAR 1D-ResNet (v6).
 
 Features
 ────────
   • Deterministic seeding via seed_everything(42) for absolute reproducibility
   • 5-fold StratifiedGroupKFold cross-validation
-  • Class-specific Focal Loss: γ=3.0 for Label 2 (hard class), γ=2.0 for all others
+  • Uniform Focal Loss (γ=2.0 for ALL classes) + Label Smoothing (ε=0.1)
     with α=inverse-frequency weights
+  • Batch-level Mixup data augmentation (Beta(α=0.2, α=0.2)) in training loop
   • AdamW optimiser (weight_decay=1e-3) + CosineAnnealingLR scheduler
   • Early stopping monitored on Validation Macro F1-Score (patience=25)
   • Dual-stream logging: compressed single-line console + full-detail file log
   • Best checkpoint saved per fold as  fold_N_best.pth  (1-indexed)
   • Full classification report + confusion matrix at final CV summary
-  • Automated 5-fold F1-Weighted TTA Ensemble inference → submission_v4_ensemble.csv
+  • Automated 5-fold F1-Weighted TTA Ensemble inference → submission_v6_ensemble.csv
 
-  v4 Changes
+  v6 Changes
   ──────────
-  • in_channels: 8 → 16  (adds 8 first-order delta feature channels from dataset.py)
-  • FocalLoss:   uniform γ=2.0 → class-specific γ (3.0 for Label 2, 2.0 for others)
-  • TTA:         each fold inference evaluates X, X×1.05, X×0.95 and averages softmax
-  • Ensemble:    uniform average → F1-weighted average (P = Σ(F1_i·P_i) / Σ(F1_i))
-  • Output CSV:  submission_v3_ensemble.csv → submission_v4_ensemble.csv
+  • in_channels: 8 → 4  (radical feature pruning: mean_x/y/z + std_mag only)
+  • base_filters: 64 → 32  (halved network width; filter cadence 32/32/64/128/256)
+  • Instance mean centering injected in dataset.py before global Z-score scaling
+  • Output CSV:  submission_v5_ensemble.csv → submission_v6_ensemble.csv
 
 Usage
 ─────
@@ -95,7 +95,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v4_ensemble.csv",
+    "submission_path"   : "./submission_v6_ensemble.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -112,17 +112,21 @@ CFG = {
     "eta_min"           : 1e-6,
 
     # Early stopping ──────────────────────────────────────────────────────────
-    "patience"          : 25,          # v3: expanded from 15 → 25
+    "patience"          : 25,
 
     # Model ───────────────────────────────────────────────────────────────────
-    "in_channels"       : 16,          # v4: 8 base + 8 delta channels
+    "in_channels"       : 4,           # v6: 4 pruned channels (mean_x/y/z + std_mag)
     "num_classes"       : 6,
-    "base_filters"      : 64,
+    "base_filters"      : 32,          # v6: halved width; cadence 32/32/64/128/256
 
-    # Focal Loss (v4: class-specific gamma — configured in FocalLoss directly)
-    # γ=3.0 for Label 2 (hard-to-classify),  γ=2.0 for all other labels
-    "focal_gamma_default"  : 2.0,
-    "focal_gamma_label2"   : 3.0,
+    # Focal Loss (v5: uniform gamma across all classes)
+    "focal_gamma"       : 2.0,         # uniform γ=2.0 for ALL classes
+
+    # Label Smoothing (v5)
+    "label_smoothing"   : 0.1,         # ε=0.1
+
+    # Mixup (v5)
+    "mixup_alpha"       : 0.2,         # Beta distribution parameter α
 
     # Cross-validation ────────────────────────────────────────────────────────
     "run_all_folds"     : False,
@@ -178,73 +182,103 @@ class DualLogger:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 2: Class-Specific Focal Loss  (v4)
+# Module 2: Focal Loss with Uniform γ and Label Smoothing  (v5)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FocalLoss(nn.Module):
     """
-    Alpha-weighted Focal Loss with class-specific focusing parameter γ.
+    Alpha-weighted Focal Loss with uniform focusing parameter γ and
+    integrated Label Smoothing (ε).
 
-    FL(p_t) = -α_t · (1 - p_t)^γ_t · log(p_t)
+    Standard Focal Loss (hard targets):
+        FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
 
-    v4 Class-specific γ assignment:
-      • γ = 3.0  for Label 2  – steep gradient penalty for hard-to-classify samples
-      • γ = 2.0  for all other labels (0, 1, 3, 4, 5)
+    v5 Label-Smoothed Focal Loss:
+      Ground-truth one-hot targets are smoothed before computing cross-entropy:
+        y_smooth[c] = (1 - ε) + ε / C   if c == true class
+        y_smooth[c] = ε / C              otherwise
+      where C = num_classes and ε = label_smoothing coefficient.
+
+      With ε=0.1 and C=6:
+        positive target  = 0.9 + 0.1/6  ≈ 0.9167
+        negative targets = 0.1/6        ≈ 0.01667
+
+      The Focal modulation uses the probability of the true class (p_t) to
+      weight the smoothed cross-entropy loss, preserving the adaptive
+      re-weighting property of Focal Loss over the soft target distribution.
+
+    v5 Uniform γ:
+      A single scalar γ=2.0 is applied identically across all 6 classes.
+      The class-specific γ=3.0 penalty for Label 2 introduced in v4 is
+      abolished; the model is encouraged to embrace distributional ambiguity
+      rather than forcing rigid boundaries on overlapping classes.
 
     Parameters
     ----------
-    alpha         : torch.Tensor, shape (num_classes,)
-                    Per-class balancing weights (inverse-frequency, normalised).
-    gamma_default : float  default focusing parameter for non-Label-2 classes (2.0)
-    gamma_label2  : float  focusing parameter specifically for Label 2 (3.0)
-    reduction     : str  'mean' | 'sum' | 'none'
+    alpha           : torch.Tensor, shape (num_classes,)
+                      Per-class balancing weights (inverse-frequency, normalised).
+    gamma           : float  uniform focusing parameter for all classes (2.0)
+    label_smoothing : float  label smoothing coefficient ε (0.1)
+    reduction       : str  'mean' | 'sum' | 'none'
     """
 
-    LABEL2_IDX = 2   # class index that receives the elevated γ
-
     def __init__(self, alpha: torch.Tensor,
-                 gamma_default: float = 2.0,
-                 gamma_label2: float  = 3.0,
-                 reduction: str = "mean"):
+                 gamma: float           = 2.0,
+                 label_smoothing: float = 0.1,
+                 reduction: str         = "mean"):
         super().__init__()
         self.register_buffer("alpha", alpha)   # (C,)
-        self.gamma_default = gamma_default
-        self.gamma_label2  = gamma_label2
-        self.reduction     = reduction
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction       = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
         logits  : (B, C)  raw model output (unnormalised)
-        targets : (B,)    integer class labels
+        targets : (B, C)  soft / smoothed target distribution  OR
+                  (B,)    integer class labels (hard targets; smoothing applied here)
+
+        Both integer hard-target and pre-smoothed soft-target inputs are
+        supported to enable straightforward Mixup integration.
         """
-        # Standard log-softmax for numerical stability
-        log_probs = F.log_softmax(logits, dim=1)              # (B, C)
-        probs     = log_probs.exp()                            # (B, C)
+        C = logits.size(1)
 
-        # Gather the log-prob and prob for the true class
-        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)   # (B,)
-        pt     = probs.gather(1, targets.unsqueeze(1)).squeeze(1)       # (B,)
+        # ── Build smoothed target distribution ────────────────────────────────
+        if targets.dim() == 1:
+            # Hard integer labels → one-hot → label-smooth
+            # y_smooth[true_class] = 1 - ε + ε/C
+            # y_smooth[other]      = ε / C
+            with torch.no_grad():
+                smooth_val    = self.label_smoothing / C
+                y_smooth      = torch.full_like(logits, smooth_val)          # (B, C)
+                y_smooth.scatter_(1, targets.unsqueeze(1),
+                                  1.0 - self.label_smoothing + smooth_val)   # (B, C)
+        else:
+            # Pre-smoothed soft targets supplied (e.g., from Mixup blending)
+            y_smooth = targets   # (B, C)
 
-        # ── Class-specific γ vector (v4) ─────────────────────────────────────
-        # Build a per-sample gamma tensor using pure PyTorch ops.
-        # Samples where target == LABEL2_IDX receive gamma_label2; all others
-        # receive gamma_default.  No Python loops; entirely vectorised.
-        gamma_vec = torch.where(
-            targets == self.LABEL2_IDX,
-            torch.full_like(pt, self.gamma_label2),
-            torch.full_like(pt, self.gamma_default),
-        )                                                                # (B,)
+        # ── Focal modulation using log-softmax ────────────────────────────────
+        log_probs = F.log_softmax(logits, dim=1)   # (B, C)
+        probs     = log_probs.exp()                 # (B, C)
 
-        # Focal modulating factor using per-sample γ
-        focal_weight = (1.0 - pt) ** gamma_vec                          # (B,)
+        # True-class probability p_t:  use argmax of smooth targets as proxy
+        # (for pure smoothed labels its argmax == original true class)
+        true_class = y_smooth.argmax(dim=1)                                  # (B,)
+        pt         = probs.gather(1, true_class.unsqueeze(1)).squeeze(1)     # (B,)
 
-        # Per-class alpha weight for each sample
-        alpha_t = self.alpha.gather(0, targets)                         # (B,)
+        # Focal modulating factor (scalar γ, uniform across all classes)
+        focal_weight = (1.0 - pt) ** self.gamma                              # (B,)
 
-        # Final per-sample loss
-        loss = -alpha_t * focal_weight * log_pt                         # (B,)
+        # Per-class α weight for each sample (indexed by true class)
+        alpha_t = self.alpha.gather(0, true_class)                           # (B,)
+
+        # Cross-entropy over the smoothed distribution:  -Σ y_smooth * log_probs
+        ce_smooth = -(y_smooth * log_probs).sum(dim=1)                       # (B,)
+
+        # Final per-sample focal loss
+        loss = alpha_t * focal_weight * ce_smooth                            # (B,)
 
         if self.reduction == "mean":
             return loss.mean()
@@ -255,11 +289,11 @@ class FocalLoss(nn.Module):
 
 def build_focal_loss(class_counts: np.ndarray,
                      device: torch.device,
-                     gamma_default: float = 2.0,
-                     gamma_label2: float  = 3.0) -> FocalLoss:
+                     gamma: float           = 2.0,
+                     label_smoothing: float = 0.1) -> FocalLoss:
     """
-    Construct a FocalLoss with inverse-frequency alpha weights and
-    class-specific γ (γ=3.0 for Label 2, γ=2.0 for all others).
+    Construct a FocalLoss with inverse-frequency alpha weights,
+    uniform γ=2.0, and label smoothing ε=0.1.
 
     weight_c = total / (N_CLASSES × count_c),  then normalised so mean = 1.
     """
@@ -268,9 +302,76 @@ def build_focal_loss(class_counts: np.ndarray,
     weights = total / (N_CLASSES * counts)
     weights = weights / weights.mean()
     alpha   = torch.tensor(weights, dtype=torch.float32, device=device)
-    return FocalLoss(alpha=alpha,
-                     gamma_default=gamma_default,
-                     gamma_label2=gamma_label2)
+    return FocalLoss(alpha=alpha, gamma=gamma, label_smoothing=label_smoothing)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Module 3: Mixup augmentation helper  (v5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def mixup_batch(signals: torch.Tensor,
+                labels: torch.Tensor,
+                alpha: float,
+                num_classes: int,
+                label_smoothing: float,
+                device: torch.device):
+    """
+    Perform batch-level Mixup interpolation on input sequences and their
+    label-smoothed target distributions.
+
+    Algorithm
+    ---------
+    1. Sample λ ~ Beta(α, α), then take max(λ, 1-λ) so λ ≥ 0.5 (optional
+       symmetry enforcement — omitted here; raw Beta sample used directly).
+    2. Generate a random permutation index to form the mixing pair (X_j, Y_j).
+    3. Linearly blend:
+         X_mixed = λ · X_i  +  (1 - λ) · X_j          (input tensor)
+         Y_mixed = λ · Y_i  +  (1 - λ) · Y_j          (soft label tensor)
+
+    The blended soft labels already incorporate Label Smoothing ε: one-hot
+    targets are first smoothed (y_smooth = (1-ε)·onehot + ε/C) and then
+    the two smoothed distributions are linearly combined with λ.
+
+    Parameters
+    ----------
+    signals       : torch.Tensor, shape (B, C, L) – batch of input sequences
+    labels        : torch.Tensor, shape (B,)       – integer hard labels
+    alpha         : float                           – Beta distribution parameter
+    num_classes   : int                             – number of output classes (C)
+    label_smoothing : float                         – label smoothing coefficient ε
+    device        : torch.device
+
+    Returns
+    -------
+    x_mixed  : torch.Tensor, shape (B, C, L)   – mixed input sequences
+    y_mixed  : torch.Tensor, shape (B, num_classes) – mixed smoothed targets
+    lam      : float                            – the sampled mixing coefficient
+    """
+    B = signals.size(0)
+
+    # ── Sample λ from Beta(α, α) ─────────────────────────────────────────────
+    if alpha > 0:
+        lam = float(np.random.beta(alpha, alpha))
+    else:
+        lam = 1.0
+
+    # ── Random permutation for the mixing partner ─────────────────────────────
+    perm = torch.randperm(B, device=device)
+
+    # ── Build label-smoothed one-hot targets for both Xi and Xj ──────────────
+    smooth_val = label_smoothing / num_classes
+    y_i        = torch.full((B, num_classes), smooth_val,
+                            dtype=torch.float32, device=device)
+    y_i.scatter_(1, labels.unsqueeze(1),
+                 1.0 - label_smoothing + smooth_val)          # (B, C)
+
+    y_j = y_i[perm]                                           # (B, C)
+
+    # ── Linear interpolation ─────────────────────────────────────────────────
+    x_mixed = lam * signals + (1.0 - lam) * signals[perm]    # (B, C, L)
+    y_mixed = lam * y_i     + (1.0 - lam) * y_j              # (B, C)
+
+    return x_mixed, y_mixed, lam
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -303,23 +404,60 @@ class EarlyStopping:
 # Single epoch helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
+def train_one_epoch(model, loader, criterion, optimizer, device,
+                    mixup_alpha: float, label_smoothing: float) -> float:
+    """
+    Train for one epoch with batch-level Mixup augmentation.
+
+    For each mini-batch:
+      1. Move data to device.
+      2. Apply Mixup: blend (X_i, Y_i) with (X_j, Y_j) using λ ~ Beta(α, α).
+      3. Forward pass on the mixed input X_mixed.
+      4. Compute label-smoothed Focal Loss on mixed soft targets Y_mixed.
+         Because FocalLoss.forward() accepts pre-smoothed soft targets (2D),
+         the Mixup-blended targets are passed directly — no secondary smoothing.
+      5. Backpropagate and clip gradients (max_norm=1.0).
+    """
     model.train()
     running_loss = 0.0
+
     for signals, labels in loader:
-        signals = signals.to(device, non_blocking=True)
-        labels  = labels.to(device,  non_blocking=True)
+        signals = signals.to(device, non_blocking=True)   # (B, 8, 300)
+        labels  = labels.to(device,  non_blocking=True)   # (B,)
+
+        # ── Mixup ─────────────────────────────────────────────────────────────
+        x_mixed, y_mixed, lam = mixup_batch(
+            signals, labels,
+            alpha=mixup_alpha,
+            num_classes=N_CLASSES,
+            label_smoothing=label_smoothing,
+            device=device,
+        )
+
         optimizer.zero_grad()
-        loss = criterion(model(signals), labels)
+
+        # ── Forward + Loss ────────────────────────────────────────────────────
+        # Pass pre-blended soft targets (2D) directly to FocalLoss.
+        # FocalLoss.forward() detects dim==2 and skips the internal smoothing
+        # step, evaluating the focal-weighted cross-entropy over y_mixed.
+        logits = model(x_mixed)
+        loss   = criterion(logits, y_mixed)
+
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
         running_loss += loss.item() * signals.size(0)
+
     return running_loss / len(loader.dataset)
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
+    """
+    Validation loop (no Mixup, no augmentation).
+    Uses hard integer labels and FocalLoss with internal label smoothing.
+    """
     model.eval()
     running_loss = 0.0
     all_preds, all_labels = [], []
@@ -327,6 +465,7 @@ def evaluate(model, loader, criterion, device):
         signals = signals.to(device, non_blocking=True)
         labels  = labels.to(device,  non_blocking=True)
         logits  = model(signals)
+        # Pass integer labels (1D) — FocalLoss applies label smoothing internally
         running_loss += criterion(logits, labels).item() * signals.size(0)
         all_preds.extend(logits.argmax(dim=1).cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
@@ -396,21 +535,25 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log_file(f"  Model: ResNet1D  |  Trainable params: {n_params:,}")
 
-    # ── Loss (v4: class-specific γ) ───────────────────────────────────────────
+    # ── Loss (v5: uniform γ=2.0 + label smoothing ε=0.1) ─────────────────────
     criterion = build_focal_loss(
         class_counts, device,
-        gamma_default=cfg["focal_gamma_default"],
-        gamma_label2=cfg["focal_gamma_label2"],
+        gamma=cfg["focal_gamma"],
+        label_smoothing=cfg["label_smoothing"],
     )
     counts    = class_counts.astype(np.float32)
     weights   = counts.sum() / (N_CLASSES * counts)
     weights   = weights / weights.mean()
     logger.log_file(
-        f"  Loss: Focal Loss (γ_default={cfg['focal_gamma_default']}, "
-        f"γ_label2={cfg['focal_gamma_label2']}, α=inverse-frequency)"
+        f"  Loss: Focal Loss (γ={cfg['focal_gamma']} uniform, "
+        f"ε={cfg['label_smoothing']} label smoothing, α=inverse-frequency)"
     )
     logger.log_file("  Effective alpha weights: " +
                     "  ".join(f"L{c}:{w:.3f}" for c, w in enumerate(weights)))
+    logger.log_file(
+        f"  Mixup: Beta(α={cfg['mixup_alpha']}, α={cfg['mixup_alpha']})  "
+        f"[training only]"
+    )
 
     # ── Optimiser + Scheduler ─────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(),
@@ -430,7 +573,11 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
     for epoch in range(1, cfg["epochs"] + 1):
         t_start    = time.time()
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device,
+            mixup_alpha=cfg["mixup_alpha"],
+            label_smoothing=cfg["label_smoothing"],
+        )
         scheduler.step()
         val_loss, val_acc, val_f1, val_preds, val_labels = evaluate(
             model, val_loader, criterion, device)
@@ -492,7 +639,7 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 3 + 4: F1-Weighted TTA Ensemble inference  (v4)
+# Module 4 + 5: F1-Weighted TTA Ensemble inference  (v5, preserved from v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -502,7 +649,7 @@ def ensemble_inference(fold_results: list, cfg: dict,
     """
     Automated 5-fold F1-Weighted TTA Ensemble inference pipeline.
 
-    Module 3 – Test-Time Augmentation (TTA):
+    Module 4 – Test-Time Augmentation (TTA):  [PRESERVED UNCHANGED from v4]
       For each test batch, three distinct scaling profiles are evaluated through
       the active fold model, and their Softmax distributions are averaged:
         1. Original:    X
@@ -510,7 +657,7 @@ def ensemble_inference(fold_results: list, cfg: dict,
         3. Scaled Down: X × 0.95
       The mean of these three distributions defines that fold's output probability.
 
-    Module 4 – F1-Weighted Softmax Averaging:
+    Module 5 – F1-Weighted Softmax Averaging:  [PRESERVED UNCHANGED from v4]
       Folds are weighted by their best validation macro F1-score:
         P_ensemble = Σ(F1_i × P_i) / Σ(F1_i)
       This replaces the uniform average (Σ P_i / N) from v3.
@@ -565,10 +712,10 @@ def ensemble_inference(fold_results: list, cfg: dict,
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model.eval()
 
-        # ── Module 3: TTA per batch ───────────────────────────────────────────
+        # ── Module 4: TTA per batch ───────────────────────────────────────────
         fold_probs = []
         for signals, _ in test_loader:
-            x_orig = signals.to(device, non_blocking=True)          # (B, 16, 300)
+            x_orig = signals.to(device, non_blocking=True)          # (B, 8, 300)
 
             # TTA variant 1: Original
             p_orig  = F.softmax(model(x_orig),              dim=1)  # (B, C)
@@ -583,7 +730,7 @@ def ensemble_inference(fold_results: list, cfg: dict,
 
         fold_probs_arr = np.concatenate(fold_probs, axis=0)          # (N, C)
 
-        # ── Module 4: F1-weighted accumulation ───────────────────────────────
+        # ── Module 5: F1-weighted accumulation ───────────────────────────────
         weighted_prob_sum += best_f1 * fold_probs_arr
         f1_weight_total   += best_f1
 
@@ -666,7 +813,7 @@ def format_confusion_matrix(all_labels, all_preds) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v4")
+    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v6")
     parser.add_argument("--all-folds",  action="store_true")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
@@ -692,7 +839,7 @@ def main():
 
     header_lines = [
         "=" * 70,
-        "  HAR 1D-ResNet Training Pipeline  (v4)",
+        "  HAR 1D-ResNet Training Pipeline  (v6)",
         "=" * 70,
         f"  Log file    : {os.path.abspath(CFG['log_path'])}",
         f"  Device      : {device}",
@@ -704,13 +851,14 @@ def main():
         ]
     header_lines += [
         f"  Seed        : {CFG['seed']}  (deterministic=True, benchmark=False)",
-        f"  In channels : {CFG['in_channels']}  (8 base + 8 delta)",
+        f"  In channels : {CFG['in_channels']}  (4 pruned: mean_x/y/z + std_mag)",
         f"  Epochs      : {CFG['epochs']}",
         f"  Batch       : {CFG['batch_size']}",
         f"  LR          : {CFG['lr']}",
         f"  Weight Decay: {CFG['weight_decay']}",
-        f"  Focal γ     : default={CFG['focal_gamma_default']}  "
-        f"Label2={CFG['focal_gamma_label2']}",
+        f"  Focal γ     : {CFG['focal_gamma']}  (uniform, all classes)",
+        f"  Label Smooth: ε={CFG['label_smoothing']}",
+        f"  Mixup α     : {CFG['mixup_alpha']}  (Beta distribution, train only)",
         f"  Patience    : {CFG['patience']}",
         f"  Folds       : {'all 5' if CFG['run_all_folds'] else 'fold 1 only'}",
         f"  Ensemble    : F1-Weighted TTA (×1.00 / ×1.05 / ×0.95)",
@@ -766,7 +914,7 @@ def main():
         logger.log(cm_text)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Module 3 + 4: Automated F1-Weighted TTA Ensemble Inference
+    # F1-Weighted TTA Ensemble Inference  (Modules 4 + 5)
     # ══════════════════════════════════════════════════════════════════════════
     # This block executes automatically after the CV loop.
     # For each fold it:
@@ -775,7 +923,8 @@ def main():
     #     distributions to produce a single fold probability vector
     # Then it combines per-fold vectors using F1-weighted averaging:
     #   P_ensemble = Σ(F1_i × P_i) / Σ(F1_i)
-    # and writes the final prediction map to submission_v4_ensemble.csv.
+    # and writes the final prediction map to submission_v5_ensemble.csv.
+    # NOTE: Mixup is strictly NOT applied during inference.
     # ──────────────────────────────────────────────────────────────────────────
     if len(fold_results) > 0:
         ensemble_submission = ensemble_inference(
@@ -786,7 +935,7 @@ def main():
         )
 
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v4 complete.")
+    logger.log("  Pipeline v6 complete.")
     logger.log(f"  Ensemble submission ready : {CFG['submission_path']}")
     logger.log("=" * 70)
 
