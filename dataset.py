@@ -7,55 +7,53 @@ for the HAR 1D-ResNet project.
 Data format:
   - Each CSV: 300 rows × columns [index, mean_x, mean_y, mean_z, std_x, std_y, std_z, label, file_id]
   - Raw feature shape after loading:  (300, 6)
-  - Pruned + magnitude channel:       (300, 4)  →  transposed to (4, 300) for 1D-CNN
+  - 8-channel feature matrix:         (300, 8)  →  transposed to (8, 300) for 1D-CNN
   - Train users: User_001 – User_060
   - Test  users: User_061 – User_100
 
-Feature Engineering (v6 — Radical Pruning)
---------------------------------------------
-  Multicollinear std_x / std_y / std_z axes are dropped entirely to resolve
-  extreme weight-thrashing in the 1D-CNN layers.  The synthesised mean_mag
-  feature is also dropped (low importance, redundant with raw axes).  Only the
-  four highest-signal channels are retained:
+Feature Engineering (v7 — Stable 8-Channel Baseline)
+------------------------------------------------------
+  Reverts to the stable v5 8-channel configuration.  The v6 radical pruning
+  and instance mean centering are completely removed.  The 8-channel set is:
 
-   Pruned Channel Map (4 channels):
+   Channel Map (8 channels):
      [0] mean_x   – raw X-axis sliding-window mean
      [1] mean_y   – raw Y-axis sliding-window mean
      [2] mean_z   – raw Z-axis sliding-window mean
-     [3] std_mag  = sqrt(std_x² + std_y² + std_z² + 1e-8)
-                    holistic dynamic-motion energy (rotation-invariant)
+     [3] std_x    – X-axis sliding-window standard deviation
+     [4] std_y    – Y-axis sliding-window standard deviation
+     [5] std_z    – Z-axis sliding-window standard deviation
+     [6] mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)  (direction magnitude)
+     [7] std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)  (motion energy)
 
-  Final output shape per sample: (4, 300).
+  Final output shape per sample: (8, 300).
 
-Instance-Level Mean Centering for Pose Elimination (v6)
----------------------------------------------------------
-  To eradicate device-wearing orientation bias (user-to-user covariate shift),
-  per-sample temporal mean centering is applied to the three directional axes
-  (channels 0–2) BEFORE global Z-score normalization:
+Dynamic Label Modes (v7 — Hierarchical Two-Stage Classifier)
+-------------------------------------------------------------
+  The HARDataset and corresponding factory functions accept a `mode` argument:
 
-      X_ch ← X_ch - mean(X_ch)    for ch ∈ {mean_x, mean_y, mean_z}
+  stage1 — 5-Class Generalist:
+    Original Labels 1 and 2 are merged into a single category.
+    Mapping:  L0 → 0 | L1,L2 → 1 | L3 → 2 | L4 → 3 | L5 → 4
+    Total output classes = 5.
 
-  std_mag (channel 3) is deliberately excluded — its absolute vibration
-  magnitude must be preserved for correct dynamic-motion representation.
-
-  Execution order:
-    1. Load raw (N, 300, 6) array
-    2. Compute std_mag, prune to (N, 300, 4)
-    3. Apply instance mean centering to channels 0–2   ← NEW (v6)
-    4. Compute per-fold Z-score statistics (training fold only)
-    5. Apply global Z-score normalisation
+  stage2 — 2-Class Specialist:
+    Only samples whose original label is 1 or 2 are retained.
+    All other samples are filtered out.
+    Mapping:  L1 → 0 | L2 → 1
+    Total output classes = 2.
 
 Augmentation (v3/v5, unchanged)
 ---------------------------------
   Applied to ALL training samples (global, not minority-only) with probability
   AUG_PROB per technique to prevent subject-signature memorisation.
 
-  PROTECTED EXEMPTION (v3): Label 2 samples are STRICTLY PROHIBITED from
-  receiving Time Masking (Cutout 1D) to preserve critical low-frequency
-  structural signals that distinguish Label 2 from Label 1.
+  PROTECTED EXEMPTION (v3/v5): Label 2 samples are STRICTLY PROHIBITED from
+  receiving Time Masking (Cutout 1D).  In stage2 mode Label 2 maps to index 1,
+  so the protection logic checks the original label before mapping.
 
   • Time Masking (Cutout 1D)  – zero out a random window of 15-30 time-steps
-                                 [DISABLED for label == 2]
+                                 [DISABLED for original label == 2]
   • Channel Masking (Sensor Dropout) – zero out 1–2 random feature channels
   • Jitter                    – add Gaussian noise
   • Scale                     – multiply by per-channel random scalar
@@ -76,43 +74,46 @@ from sklearn.model_selection import StratifiedGroupKFold
 # ──────────────────────────────────────────
 FEATURE_COLS  = ["mean_x", "mean_y", "mean_z", "std_x", "std_y", "std_z"]
 RAW_CHANNELS  = len(FEATURE_COLS)   # 6  (original sensor columns in CSV)
-N_CHANNELS    = 4                   # v6: 4 pruned channels (mean_x/y/z + std_mag)
+N_CHANNELS    = 8                   # v7: 8 stable channels (mean_x/y/z + std_x/y/z + mean_mag + std_mag)
 SEQ_LEN       = 300
-N_CLASSES     = 6
+N_CLASSES     = 6                   # original label space (0–5)
+N_CLASSES_S1  = 5                   # Stage 1: 5-class generalist (L1+L2 merged)
+N_CLASSES_S2  = 2                   # Stage 2: 2-class specialist (L1 vs L2)
 N_FOLDS       = 5
 
+# Stage 1 label mapping: original → stage1 index
+# L0→0, L1→1, L2→1, L3→2, L4→3, L5→4
+STAGE1_MAP = {0: 0, 1: 1, 2: 1, 3: 2, 4: 3, 5: 4}
+
+# Stage 2 label mapping: original L1/L2 only → binary index
+# L1→0, L2→1
+STAGE2_MAP = {1: 0, 2: 1}
+
 # ── Augmentation hyper-parameters ─────────────────────────────────────────────
-# Global execution probability: each augmentation technique fires independently
-AUG_PROB            = 0.5
+AUG_PROB         = 0.5
+TIME_MASK_MIN    = 15
+TIME_MASK_MAX    = 30
+CHANNEL_MASK_MIN = 1
+CHANNEL_MASK_MAX = 2
+JITTER_SIGMA     = 0.05
+SCALE_LOW        = 0.9
+SCALE_HIGH       = 1.1
 
-# Time masking (Cutout 1D)
-TIME_MASK_MIN       = 15   # minimum masked window length (time steps)
-TIME_MASK_MAX       = 30   # maximum masked window length (time steps)
-
-# Channel masking (Sensor Dropout)
-CHANNEL_MASK_MIN    = 1    # minimum number of channels to zero out
-CHANNEL_MASK_MAX    = 2    # maximum number of channels to zero out
-
-# Jitter noise std and scale range
-JITTER_SIGMA = 0.05
-SCALE_LOW    = 0.9
-SCALE_HIGH   = 1.1
-
-# Protected label: Time Masking is strictly disabled for this class
-PROTECTED_LABEL = 2
+# Original label whose time masking is protected (before any remapping)
+PROTECTED_ORIG_LABEL = 2
 
 
 # ──────────────────────────────────────────
-# Pruned feature engineering  (v6)
+# 8-Channel feature engineering  (v7 stable baseline)
 # ──────────────────────────────────────────
 
-def build_pruned_channels(sig: np.ndarray) -> np.ndarray:
+def build_feature_channels(sig: np.ndarray) -> np.ndarray:
     """
-    Construct the 4-channel pruned feature matrix from the raw 6-channel input.
+    Construct the 8-channel feature matrix from the raw 6-channel input.
 
-    Drops std_x, std_y, std_z (multicollinear, correlation 0.93–0.98) and
-    mean_mag (low importance).  Retains mean_x/y/z (raw directional signal)
-    plus std_mag (rotation-invariant motion-energy scalar).
+    Adds:
+      [6] mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)
+      [7] std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)
 
     Parameters
     ----------
@@ -121,54 +122,20 @@ def build_pruned_channels(sig: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    out : np.ndarray, shape (300, 4)
-          Columns: [mean_x, mean_y, mean_z, std_mag]
+    out : np.ndarray, shape (300, 8)
+          Columns: [mean_x, mean_y, mean_z, std_x, std_y, std_z, mean_mag, std_mag]
     """
     mean_x, mean_y, mean_z = sig[:, 0], sig[:, 1], sig[:, 2]
     std_x,  std_y,  std_z  = sig[:, 3], sig[:, 4], sig[:, 5]
 
-    std_mag = np.sqrt(std_x ** 2 + std_y ** 2 + std_z ** 2 + 1e-8).astype(np.float32)
-    std_mag = std_mag[:, np.newaxis]   # (300, 1)
+    mean_mag = np.sqrt(mean_x ** 2 + mean_y ** 2 + mean_z ** 2 + 1e-8).astype(np.float32)
+    std_mag  = np.sqrt(std_x  ** 2 + std_y  ** 2 + std_z  ** 2 + 1e-8).astype(np.float32)
 
-    # Stack: mean_x / mean_y / mean_z already in sig[:, 0:3]
-    out = np.concatenate([sig[:, 0:3], std_mag], axis=1)   # (300, 4)
-    return out
+    mean_mag = mean_mag[:, np.newaxis]  # (300, 1)
+    std_mag  = std_mag[:, np.newaxis]   # (300, 1)
 
-
-# ──────────────────────────────────────────
-# Instance-level mean centering  (v6)
-# ──────────────────────────────────────────
-
-def apply_instance_centering(signals: np.ndarray) -> np.ndarray:
-    """
-    Apply sample-wise temporal mean centering to the three directional axes
-    (channels 0–2: mean_x, mean_y, mean_z) to eradicate device-placement
-    orientation bias across users.
-
-    For every individual 300-timestep sequence X:
-        X[:, ch] ← X[:, ch] - mean(X[:, ch])    for ch in {0, 1, 2}
-
-    Channel 3 (std_mag) is INTENTIONALLY EXCLUDED — its absolute vibration
-    magnitude must be preserved for correct dynamic-motion representation.
-
-    This centering is executed BEFORE global Z-score normalization so that
-    fold-level statistics are computed on orientation-corrected signals.
-
-    Parameters
-    ----------
-    signals : np.ndarray, shape (N, 300, 4)
-              Raw pruned feature arrays (not yet normalised).
-
-    Returns
-    -------
-    centered : np.ndarray, shape (N, 300, 4)
-               Channels 0–2 centered per-sample; channel 3 unchanged.
-    """
-    centered = signals.copy()
-    # Center channels 0, 1, 2 independently for each sample
-    # mean over 300 timesteps: axis=1 → shape (N, 1) after keepdims
-    centered[:, :, 0:3] -= centered[:, :, 0:3].mean(axis=1, keepdims=True)
-    return centered
+    out = np.concatenate([sig[:, 0:6], mean_mag, std_mag], axis=1)  # (300, 8)
+    return out.astype(np.float32)
 
 
 # ──────────────────────────────────────────
@@ -181,9 +148,8 @@ def load_all_samples(root_dir: str):
 
     Returns
     -------
-    signals  : np.ndarray, shape (N, 300, 4)  – pruned 4-channel feature array
-                                                 (NOT yet instance-centred or normalised)
-    labels   : np.ndarray, shape (N,)          – integer class index
+    signals  : np.ndarray, shape (N, 300, 8)  – 8-channel feature array (NOT normalised)
+    labels   : np.ndarray, shape (N,)          – original integer class index (0–5)
     groups   : np.ndarray, shape (N,)          – integer user id (for GroupKFold)
     file_ids : np.ndarray, shape (N,)          – original file_id value (for submission)
     """
@@ -199,25 +165,24 @@ def load_all_samples(root_dir: str):
     for path in csv_files:
         df = pd.read_csv(path)
 
-        # --- raw feature matrix (300, 6)
+        # raw feature matrix (300, 6)
         sig_raw = df[FEATURE_COLS].values.astype(np.float32)
         assert sig_raw.shape == (SEQ_LEN, RAW_CHANNELS), \
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
-        # --- prune to 4-channel representation: [mean_x, mean_y, mean_z, std_mag]
-        sig = build_pruned_channels(sig_raw)          # (300, 4)
+        # build 8-channel feature matrix
+        sig = build_feature_channels(sig_raw)          # (300, 8)
         assert sig.shape == (SEQ_LEN, N_CHANNELS), \
-            f"Unexpected post-pruning shape {sig.shape} for file {path}"
+            f"Unexpected post-feature shape {sig.shape} for file {path}"
 
-        # --- label (one label per file, guaranteed consistent)
+        # label (one label per file, guaranteed consistent)
         lbl = int(df["label"].iloc[0])
 
-        # --- group: derive integer user id from directory name
-        # e.g. ".../User_042/00017.csv"  →  42
+        # group: derive integer user id from directory name
         user_dir  = os.path.basename(os.path.dirname(path))   # "User_042"
         user_id   = int(user_dir.split("_")[1])                # 42
 
-        # --- file_id for submission
+        # file_id for submission
         file_id = int(df["file_id"].iloc[0])
 
         signals_list.append(sig)
@@ -225,7 +190,7 @@ def load_all_samples(root_dir: str):
         groups_list.append(user_id)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 4)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 8)
     labels   = np.array(labels_list,   dtype=np.int64)
     groups   = np.array(groups_list,   dtype=np.int64)
     file_ids = np.array(file_ids_list, dtype=np.int64)
@@ -239,25 +204,24 @@ def compute_normalization_params(signals: np.ndarray):
 
     Parameters
     ----------
-    signals : np.ndarray, shape (N, 300, 4)
+    signals : np.ndarray, shape (N, 300, 8)
 
     Returns
     -------
-    mean : np.ndarray, shape (4,)
-    std  : np.ndarray, shape (4,)
+    mean : np.ndarray, shape (8,)
+    std  : np.ndarray, shape (8,)
     """
-    # Reshape to (N*300, 4) then compute stats along axis 0
     flat = signals.reshape(-1, N_CHANNELS)
     mean = flat.mean(axis=0).astype(np.float32)
     std  = flat.std(axis=0).astype(np.float32)
-    std  = np.where(std < 1e-8, 1.0, std)   # avoid division by zero
+    std  = np.where(std < 1e-8, 1.0, std)
     return mean, std
 
 
 def normalize(signals: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """
     Apply Z-score normalization using *pre-computed* mean/std.
-    signals : (N, 300, 4)  →  returns (N, 300, 4)
+    signals : (N, 300, 8)  →  returns (N, 300, 8)
     """
     return (signals - mean[np.newaxis, np.newaxis, :]) / std[np.newaxis, np.newaxis, :]
 
@@ -265,7 +229,8 @@ def normalize(signals: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndar
 def get_fold_splits(signals, labels, groups, fold_idx: int = 0):
     """
     Split data into (train_idx, val_idx) for the requested fold using
-    StratifiedGroupKFold, ensuring the same user never spans both splits.
+    StratifiedGroupKFold on the ORIGINAL labels (0–5), ensuring the same
+    user never spans both splits.
 
     Returns
     -------
@@ -278,17 +243,50 @@ def get_fold_splits(signals, labels, groups, fold_idx: int = 0):
 
 
 # ──────────────────────────────────────────
+# Label remapping helpers
+# ──────────────────────────────────────────
+
+def remap_labels_stage1(labels: np.ndarray) -> np.ndarray:
+    """
+    Remap original 6-class labels to 5-class Stage 1 labels.
+    L0→0, L1→1, L2→1, L3→2, L4→3, L5→4
+    """
+    out = np.empty_like(labels)
+    for orig, mapped in STAGE1_MAP.items():
+        out[labels == orig] = mapped
+    return out
+
+
+def filter_and_remap_stage2(signals: np.ndarray, labels: np.ndarray):
+    """
+    Filter to only L1/L2 samples and remap to binary labels.
+    L1→0, L2→1
+
+    Returns
+    -------
+    filtered_signals : np.ndarray, shape (M, 300, 8)
+    filtered_labels  : np.ndarray, shape (M,)   – binary (0 or 1)
+    mask             : np.ndarray, shape (N,)    – boolean mask used for filtering
+    """
+    mask = (labels == 1) | (labels == 2)
+    filtered_signals = signals[mask]
+    raw_labels       = labels[mask]
+    filtered_labels  = np.array([STAGE2_MAP[int(l)] for l in raw_labels], dtype=np.int64)
+    return filtered_signals, filtered_labels, mask
+
+
+# ──────────────────────────────────────────
 # Augmentation helpers (applied per sample)
 # ──────────────────────────────────────────
 
 def augment_jitter(signal: np.ndarray) -> np.ndarray:
-    """Add Gaussian noise to simulate sensor variance. signal: (300, 4)"""
+    """Add Gaussian noise to simulate sensor variance. signal: (300, 8)"""
     noise = np.random.normal(0.0, JITTER_SIGMA, size=signal.shape).astype(np.float32)
     return signal + noise
 
 
 def augment_scale(signal: np.ndarray) -> np.ndarray:
-    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 4)"""
+    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 8)"""
     scale = np.random.uniform(SCALE_LOW, SCALE_HIGH, size=(1, N_CHANNELS)).astype(np.float32)
     return signal * scale
 
@@ -296,19 +294,11 @@ def augment_scale(signal: np.ndarray) -> np.ndarray:
 def augment_time_masking(signal: np.ndarray) -> np.ndarray:
     """
     Cutout 1D – zero out a contiguous window of TIME_MASK_MIN to TIME_MASK_MAX
-    time steps chosen uniformly at random.
-
-    Parameters
-    ----------
-    signal : np.ndarray, shape (300, 4)
-
-    Returns
-    -------
-    augmented signal : np.ndarray, shape (300, 4)
+    time steps chosen uniformly at random.  signal: (300, 8)
     """
     signal = signal.copy()
-    mask_len   = np.random.randint(TIME_MASK_MIN, TIME_MASK_MAX + 1)
-    start      = np.random.randint(0, SEQ_LEN - mask_len + 1)
+    mask_len = np.random.randint(TIME_MASK_MIN, TIME_MASK_MAX + 1)
+    start    = np.random.randint(0, SEQ_LEN - mask_len + 1)
     signal[start : start + mask_len, :] = 0.0
     return signal
 
@@ -316,44 +306,26 @@ def augment_time_masking(signal: np.ndarray) -> np.ndarray:
 def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
     """
     Sensor Dropout – zero out CHANNEL_MASK_MIN to CHANNEL_MASK_MAX feature
-    channels chosen uniformly at random (without replacement).
-
-    Parameters
-    ----------
-    signal : np.ndarray, shape (300, 4)
-
-    Returns
-    -------
-    augmented signal : np.ndarray, shape (300, 4)
+    channels chosen uniformly at random.  signal: (300, 8)
     """
-    signal       = signal.copy()
-    n_mask       = np.random.randint(CHANNEL_MASK_MIN, CHANNEL_MASK_MAX + 1)
-    channels     = np.random.choice(N_CHANNELS, size=n_mask, replace=False)
+    signal   = signal.copy()
+    n_mask   = np.random.randint(CHANNEL_MASK_MIN, CHANNEL_MASK_MAX + 1)
+    channels = np.random.choice(N_CHANNELS, size=n_mask, replace=False)
     signal[:, channels] = 0.0
     return signal
 
 
-def apply_augmentation(signal: np.ndarray, label: int) -> np.ndarray:
+def apply_augmentation(signal: np.ndarray, orig_label: int) -> np.ndarray:
     """
     Apply all augmentations independently with probability AUG_PROB each.
-    Operates on signal of shape (300, 4) and returns the same shape.
+    Operates on signal of shape (300, 8) and returns the same shape.
 
-    Protected Exemption (v3/v5/v6):
-      If label == PROTECTED_LABEL (2), Time Masking (Cutout 1D) is
-      strictly skipped to preserve critical low-frequency structural signals
-      that differentiate Label 2 from Label 1.
-
-    Augmentation order:
-      1. Time Masking  (Cutout 1D)    ← SKIPPED if label == 2
-      2. Channel Masking (Sensor Dropout)
-      3. Jitter
-      4. Scale
+    orig_label : the ORIGINAL label (0–5) before any mode remapping.
+    Protected Exemption: Time Masking is skipped when orig_label == PROTECTED_ORIG_LABEL (2).
     """
-    # Time Masking: disabled for PROTECTED_LABEL to avoid structural signal loss
-    if label != PROTECTED_LABEL:
+    if orig_label != PROTECTED_ORIG_LABEL:
         if np.random.rand() < AUG_PROB:
             signal = augment_time_masking(signal)
-
     if np.random.rand() < AUG_PROB:
         signal = augment_channel_masking(signal)
     if np.random.rand() < AUG_PROB:
@@ -369,36 +341,39 @@ def apply_augmentation(signal: np.ndarray, label: int) -> np.ndarray:
 
 class HARDataset(Dataset):
     """
-    PyTorch Dataset for HAR sequences.
+    PyTorch Dataset for HAR sequences supporting dynamic label modes.
 
     Parameters
     ----------
-    signals    : np.ndarray, shape (N, 300, 4)  – already instance-centred and normalised
-    labels     : np.ndarray, shape (N,)
-    is_train   : bool  – enables global augmentation for ALL classes during training
+    signals      : np.ndarray, shape (N, 300, 8)  – already normalised
+    labels       : np.ndarray, shape (N,)          – ALREADY remapped for the target mode
+    orig_labels  : np.ndarray, shape (N,)          – original 0–5 labels (for augmentation protection)
+    is_train     : bool  – enables global augmentation during training
     """
 
-    def __init__(self, signals: np.ndarray, labels: np.ndarray, is_train: bool = False):
-        self.signals  = signals.astype(np.float32)  # (N, 300, 4)
-        self.labels   = labels.astype(np.int64)
-        self.is_train = is_train
+    def __init__(self,
+                 signals:     np.ndarray,
+                 labels:      np.ndarray,
+                 orig_labels: np.ndarray,
+                 is_train:    bool = False):
+        self.signals     = signals.astype(np.float32)  # (N, 300, 8)
+        self.labels      = labels.astype(np.int64)
+        self.orig_labels = orig_labels.astype(np.int64)
+        self.is_train    = is_train
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].copy()   # (300, 4)
-        label  = self.labels[idx]
+        signal     = self.signals[idx].copy()   # (300, 8)
+        label      = self.labels[idx]
+        orig_label = self.orig_labels[idx]
 
-        # Apply augmentation during training for ALL classes (global augmentation).
-        # Individual techniques fire stochastically at probability AUG_PROB each,
-        # preventing the model from memorising majority-class subject signatures.
-        # EXCEPTION: Time Masking is strictly skipped when label == PROTECTED_LABEL (2).
         if self.is_train:
-            signal = apply_augmentation(signal, int(label))
+            signal = apply_augmentation(signal, int(orig_label))
 
-        # Transpose: (300, 4)  →  (4, 300)  for 1D-CNN input (C, L)
-        signal = signal.T  # (4, 300)
+        # Transpose: (300, 8)  →  (8, 300)  for 1D-CNN input (C, L)
+        signal = signal.T  # (8, 300)
 
         return torch.from_numpy(signal), torch.tensor(label, dtype=torch.long)
 
@@ -409,7 +384,7 @@ class HARTestDataset(Dataset):
 
     Parameters
     ----------
-    signals  : np.ndarray, shape (N, 300, 4)  – already instance-centred and normalised
+    signals  : np.ndarray, shape (N, 300, 8)  – already normalised
     file_ids : np.ndarray, shape (N,)           – for submission mapping
     """
 
@@ -421,57 +396,88 @@ class HARTestDataset(Dataset):
         return len(self.signals)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].T.copy()   # (4, 300)
+        signal = self.signals[idx].T.copy()   # (8, 300)
         return torch.from_numpy(signal), self.file_ids[idx]
 
 
 # ──────────────────────────────────────────
-# Convenience factory
+# Convenience factories
 # ──────────────────────────────────────────
 
-def build_fold_datasets(train_root: str, fold_idx: int = 0):
+def build_fold_datasets(train_root: str,
+                        fold_idx:   int  = 0,
+                        mode:       str  = "stage1"):
     """
-    Full pipeline for one CV fold.
+    Full pipeline for one CV fold with dynamic label mode.
 
-    Processing order (v6):
-      1. Load raw feature arrays → (N, 300, 4)  [mean_x, mean_y, mean_z, std_mag]
-      2. Apply instance mean centering to channels 0–2 per sample (BEFORE global stats)
+    Processing order (v7):
+      1. Load raw feature arrays → (N, 300, 8)  [mean_x/y/z + std_x/y/z + mean_mag + std_mag]
+      2. Split into train/val using StratifiedGroupKFold on original labels
       3. Compute per-fold Z-score statistics from training fold only  (no leakage)
       4. Apply global Z-score normalisation to train and validation splits
+      5. Apply label mode mapping (stage1 or stage2)
+
+    Parameters
+    ----------
+    train_root : str    – path to training data directory
+    fold_idx   : int    – 0-indexed fold number
+    mode       : str    – 'stage1'  →  5-class generalist
+                          'stage2'  →  2-class specialist (L1 vs L2 only)
 
     Returns
     -------
-    train_dataset : HARDataset  (global augmentation ON, with L2 time-mask protection)
-    val_dataset   : HARDataset  (no augmentation)
+    train_dataset : HARDataset
+    val_dataset   : HARDataset
     norm_params   : (mean, std) tuple – derived from training fold only
-    class_counts  : np.ndarray, shape (N_CLASSES,) – for loss weighting
+    class_counts  : np.ndarray  – per-class sample counts in the training split
+                                   (indexed by remapped label)
+    n_classes_out : int          – number of output classes for this mode
     """
     signals, labels, groups, _ = load_all_samples(train_root)
 
     train_idx, val_idx = get_fold_splits(signals, labels, groups, fold_idx)
 
-    # ── v6: Instance mean centering BEFORE global Z-score statistics ──────────
-    # Apply per-sample centering on the full signal array (both splits).
-    # This ensures fold-level normalization statistics are computed on
-    # orientation-corrected data.
-    signals = apply_instance_centering(signals)
-
-    # Compute normalisation from training fold only → no leakage
+    # Compute normalisation from training fold only (no leakage)
     mean, std = compute_normalization_params(signals[train_idx])
 
-    train_signals = normalize(signals[train_idx], mean, std)
-    val_signals   = normalize(signals[val_idx],   mean, std)
+    train_signals_norm = normalize(signals[train_idx], mean, std)
+    val_signals_norm   = normalize(signals[val_idx],   mean, std)
 
-    train_labels  = labels[train_idx]
-    val_labels    = labels[val_idx]
+    train_labels_orig = labels[train_idx]
+    val_labels_orig   = labels[val_idx]
 
-    # Class counts for loss weighting / logging
-    class_counts = np.bincount(train_labels, minlength=N_CLASSES)
+    if mode == "stage1":
+        train_labels_mapped = remap_labels_stage1(train_labels_orig)
+        val_labels_mapped   = remap_labels_stage1(val_labels_orig)
+        n_classes_out       = N_CLASSES_S1
+        class_counts        = np.bincount(train_labels_mapped, minlength=N_CLASSES_S1)
 
-    train_dataset = HARDataset(train_signals, train_labels, is_train=True)
-    val_dataset   = HARDataset(val_signals,   val_labels,   is_train=False)
+        train_dataset = HARDataset(train_signals_norm, train_labels_mapped,
+                                   train_labels_orig, is_train=True)
+        val_dataset   = HARDataset(val_signals_norm,   val_labels_mapped,
+                                   val_labels_orig,   is_train=False)
 
-    return train_dataset, val_dataset, (mean, std), class_counts
+    elif mode == "stage2":
+        # Filter to L1/L2 samples only in both splits
+        train_sig_s2, train_lbl_s2, train_mask = filter_and_remap_stage2(
+            train_signals_norm, train_labels_orig)
+        val_sig_s2,   val_lbl_s2,   val_mask   = filter_and_remap_stage2(
+            val_signals_norm,   val_labels_orig)
+
+        train_orig_s2 = train_labels_orig[train_mask]
+        val_orig_s2   = val_labels_orig[val_mask]
+
+        n_classes_out = N_CLASSES_S2
+        class_counts  = np.bincount(train_lbl_s2, minlength=N_CLASSES_S2)
+
+        train_dataset = HARDataset(train_sig_s2, train_lbl_s2,
+                                   train_orig_s2, is_train=True)
+        val_dataset   = HARDataset(val_sig_s2,   val_lbl_s2,
+                                   val_orig_s2,   is_train=False)
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Choose 'stage1' or 'stage2'.")
+
+    return train_dataset, val_dataset, (mean, std), class_counts, n_classes_out
 
 
 def load_test_samples(root_dir: str):
@@ -481,8 +487,7 @@ def load_test_samples(root_dir: str):
 
     Returns
     -------
-    signals  : np.ndarray, shape (N, 300, 4)  – pruned 4-channel array
-                                                 (NOT yet instance-centred or normalised)
+    signals  : np.ndarray, shape (N, 300, 8)  – 8-channel array (NOT normalised)
     file_ids : np.ndarray, shape (N,)
     """
     csv_files = sorted(glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True))
@@ -499,15 +504,14 @@ def load_test_samples(root_dir: str):
         assert sig_raw.shape == (SEQ_LEN, RAW_CHANNELS), \
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
-        # Prune to 4-channel representation
-        sig = build_pruned_channels(sig_raw)   # (300, 4)
+        sig = build_feature_channels(sig_raw)   # (300, 8)
 
         file_id = int(df["file_id"].iloc[0])
 
         signals_list.append(sig)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 4)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 8)
     file_ids = np.array(file_ids_list, dtype=np.int64)
 
     return signals, file_ids
@@ -517,10 +521,10 @@ def build_test_dataset(test_root: str, norm_mean: np.ndarray, norm_std: np.ndarr
     """
     Build the test dataset using normalisation parameters from the training fold.
 
-    Processing order (v6):
-      1. Load raw test signals → (N, 300, 4)
-      2. Apply instance mean centering to channels 0–2 (mirrors training pipeline)
-      3. Apply global Z-score normalisation using fold-derived mean/std
+    Processing order (v7):
+      1. Load raw test signals → (N, 300, 8)
+      2. Apply global Z-score normalisation using fold-derived mean/std
+         (No instance centering – mirrors the v7 training pipeline)
 
     Returns
     -------
@@ -528,9 +532,5 @@ def build_test_dataset(test_root: str, norm_mean: np.ndarray, norm_std: np.ndarr
     file_ids     : np.ndarray
     """
     signals, file_ids = load_test_samples(test_root)
-
-    # ── v6: Instance mean centering BEFORE global normalisation ──────────────
-    signals = apply_instance_centering(signals)
-
     test_signals = normalize(signals, norm_mean, norm_std)
     return HARTestDataset(test_signals, file_ids), file_ids

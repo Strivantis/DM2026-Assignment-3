@@ -3,3 +3,4 @@ train/*
 *.md
 *.csv
 *.txt
+checkpoints/*
