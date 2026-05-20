@@ -1,19 +1,28 @@
 """
 train.py
 --------
-End-to-end training pipeline for the HAR 1D-ResNet (v3).
+End-to-end training pipeline for the HAR 1D-ResNet (v4).
 
 Features
 ────────
   • Deterministic seeding via seed_everything(42) for absolute reproducibility
   • 5-fold StratifiedGroupKFold cross-validation
-  • Alpha-weighted Focal Loss  (γ=2.0, α=inverse-frequency weights)
+  • Class-specific Focal Loss: γ=3.0 for Label 2 (hard class), γ=2.0 for all others
+    with α=inverse-frequency weights
   • AdamW optimiser (weight_decay=1e-3) + CosineAnnealingLR scheduler
   • Early stopping monitored on Validation Macro F1-Score (patience=25)
   • Dual-stream logging: compressed single-line console + full-detail file log
   • Best checkpoint saved per fold as  fold_N_best.pth  (1-indexed)
   • Full classification report + confusion matrix at final CV summary
-  • Automated 5-fold Softmax Averaging Ensemble inference → submission_v3_ensemble.csv
+  • Automated 5-fold F1-Weighted TTA Ensemble inference → submission_v4_ensemble.csv
+
+  v4 Changes
+  ──────────
+  • in_channels: 8 → 16  (adds 8 first-order delta feature channels from dataset.py)
+  • FocalLoss:   uniform γ=2.0 → class-specific γ (3.0 for Label 2, 2.0 for others)
+  • TTA:         each fold inference evaluates X, X×1.05, X×0.95 and averages softmax
+  • Ensemble:    uniform average → F1-weighted average (P = Σ(F1_i·P_i) / Σ(F1_i))
+  • Output CSV:  submission_v3_ensemble.csv → submission_v4_ensemble.csv
 
 Usage
 ─────
@@ -86,7 +95,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v3_ensemble.csv",
+    "submission_path"   : "./submission_v4_ensemble.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -106,12 +115,14 @@ CFG = {
     "patience"          : 25,          # v3: expanded from 15 → 25
 
     # Model ───────────────────────────────────────────────────────────────────
-    "in_channels"       : 8,           # v3: 6 raw + 2 magnitude channels
+    "in_channels"       : 16,          # v4: 8 base + 8 delta channels
     "num_classes"       : 6,
     "base_filters"      : 64,
 
-    # Focal Loss ──────────────────────────────────────────────────────────────
-    "focal_gamma"       : 2.0,
+    # Focal Loss (v4: class-specific gamma — configured in FocalLoss directly)
+    # γ=3.0 for Label 2 (hard-to-classify),  γ=2.0 for all other labels
+    "focal_gamma_default"  : 2.0,
+    "focal_gamma_label2"   : 3.0,
 
     # Cross-validation ────────────────────────────────────────────────────────
     "run_all_folds"     : False,
@@ -167,29 +178,39 @@ class DualLogger:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Focal Loss
+# Module 2: Class-Specific Focal Loss  (v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FocalLoss(nn.Module):
     """
-    Alpha-weighted Focal Loss for multi-class classification.
+    Alpha-weighted Focal Loss with class-specific focusing parameter γ.
 
-    FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
+    FL(p_t) = -α_t · (1 - p_t)^γ_t · log(p_t)
+
+    v4 Class-specific γ assignment:
+      • γ = 3.0  for Label 2  – steep gradient penalty for hard-to-classify samples
+      • γ = 2.0  for all other labels (0, 1, 3, 4, 5)
 
     Parameters
     ----------
-    alpha  : torch.Tensor, shape (num_classes,)
-             Per-class balancing weights (inverse-frequency, normalised).
-    gamma  : float  focusing parameter (default 2.0)
-    reduction : str  'mean' | 'sum' | 'none'
+    alpha         : torch.Tensor, shape (num_classes,)
+                    Per-class balancing weights (inverse-frequency, normalised).
+    gamma_default : float  default focusing parameter for non-Label-2 classes (2.0)
+    gamma_label2  : float  focusing parameter specifically for Label 2 (3.0)
+    reduction     : str  'mean' | 'sum' | 'none'
     """
 
-    def __init__(self, alpha: torch.Tensor, gamma: float = 2.0,
+    LABEL2_IDX = 2   # class index that receives the elevated γ
+
+    def __init__(self, alpha: torch.Tensor,
+                 gamma_default: float = 2.0,
+                 gamma_label2: float  = 3.0,
                  reduction: str = "mean"):
         super().__init__()
         self.register_buffer("alpha", alpha)   # (C,)
-        self.gamma     = gamma
-        self.reduction = reduction
+        self.gamma_default = gamma_default
+        self.gamma_label2  = gamma_label2
+        self.reduction     = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
@@ -198,8 +219,7 @@ class FocalLoss(nn.Module):
         logits  : (B, C)  raw model output (unnormalised)
         targets : (B,)    integer class labels
         """
-        # Standard cross-entropy per sample with class-weight α
-        # log_softmax is numerically stable
+        # Standard log-softmax for numerical stability
         log_probs = F.log_softmax(logits, dim=1)              # (B, C)
         probs     = log_probs.exp()                            # (B, C)
 
@@ -207,8 +227,18 @@ class FocalLoss(nn.Module):
         log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)   # (B,)
         pt     = probs.gather(1, targets.unsqueeze(1)).squeeze(1)       # (B,)
 
-        # Focal modulating factor
-        focal_weight = (1.0 - pt) ** self.gamma                         # (B,)
+        # ── Class-specific γ vector (v4) ─────────────────────────────────────
+        # Build a per-sample gamma tensor using pure PyTorch ops.
+        # Samples where target == LABEL2_IDX receive gamma_label2; all others
+        # receive gamma_default.  No Python loops; entirely vectorised.
+        gamma_vec = torch.where(
+            targets == self.LABEL2_IDX,
+            torch.full_like(pt, self.gamma_label2),
+            torch.full_like(pt, self.gamma_default),
+        )                                                                # (B,)
+
+        # Focal modulating factor using per-sample γ
+        focal_weight = (1.0 - pt) ** gamma_vec                          # (B,)
 
         # Per-class alpha weight for each sample
         alpha_t = self.alpha.gather(0, targets)                         # (B,)
@@ -225,9 +255,11 @@ class FocalLoss(nn.Module):
 
 def build_focal_loss(class_counts: np.ndarray,
                      device: torch.device,
-                     gamma: float = 2.0) -> FocalLoss:
+                     gamma_default: float = 2.0,
+                     gamma_label2: float  = 3.0) -> FocalLoss:
     """
-    Construct a FocalLoss with inverse-frequency alpha weights.
+    Construct a FocalLoss with inverse-frequency alpha weights and
+    class-specific γ (γ=3.0 for Label 2, γ=2.0 for all others).
 
     weight_c = total / (N_CLASSES × count_c),  then normalised so mean = 1.
     """
@@ -236,7 +268,9 @@ def build_focal_loss(class_counts: np.ndarray,
     weights = total / (N_CLASSES * counts)
     weights = weights / weights.mean()
     alpha   = torch.tensor(weights, dtype=torch.float32, device=device)
-    return FocalLoss(alpha=alpha, gamma=gamma)
+    return FocalLoss(alpha=alpha,
+                     gamma_default=gamma_default,
+                     gamma_label2=gamma_label2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -362,12 +396,19 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log_file(f"  Model: ResNet1D  |  Trainable params: {n_params:,}")
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
-    criterion = build_focal_loss(class_counts, device, gamma=cfg["focal_gamma"])
+    # ── Loss (v4: class-specific γ) ───────────────────────────────────────────
+    criterion = build_focal_loss(
+        class_counts, device,
+        gamma_default=cfg["focal_gamma_default"],
+        gamma_label2=cfg["focal_gamma_label2"],
+    )
     counts    = class_counts.astype(np.float32)
     weights   = counts.sum() / (N_CLASSES * counts)
     weights   = weights / weights.mean()
-    logger.log_file(f"  Loss: Focal Loss (γ={cfg['focal_gamma']}, α=inverse-frequency)")
+    logger.log_file(
+        f"  Loss: Focal Loss (γ_default={cfg['focal_gamma_default']}, "
+        f"γ_label2={cfg['focal_gamma_label2']}, α=inverse-frequency)"
+    )
     logger.log_file("  Effective alpha weights: " +
                     "  ".join(f"L{c}:{w:.3f}" for c, w in enumerate(weights)))
 
@@ -451,7 +492,7 @@ def train_fold(fold_idx: int, device: torch.device, cfg: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Softmax Averaging Ensemble inference (Module 4)
+# Module 3 + 4: F1-Weighted TTA Ensemble inference  (v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -459,14 +500,20 @@ def ensemble_inference(fold_results: list, cfg: dict,
                        device: torch.device,
                        logger: DualLogger) -> pd.DataFrame:
     """
-    Automated 5-fold Softmax Averaging Ensemble inference pipeline.
+    Automated 5-fold F1-Weighted TTA Ensemble inference pipeline.
 
-    For every test sample:
-      1. Load saved best checkpoint for each fold (fold_1_best.pth … fold_5_best.pth).
-      2. Extract raw logits from each model.
-      3. Convert to per-class probability distributions via Softmax.
-      4. Average the 5 probability distributions (Softmax Averaging).
-      5. Apply argmax to obtain the ensemble final prediction.
+    Module 3 – Test-Time Augmentation (TTA):
+      For each test batch, three distinct scaling profiles are evaluated through
+      the active fold model, and their Softmax distributions are averaged:
+        1. Original:    X
+        2. Scaled Up:   X × 1.05
+        3. Scaled Down: X × 0.95
+      The mean of these three distributions defines that fold's output probability.
+
+    Module 4 – F1-Weighted Softmax Averaging:
+      Folds are weighted by their best validation macro F1-score:
+        P_ensemble = Σ(F1_i × P_i) / Σ(F1_i)
+      This replaces the uniform average (Σ P_i / N) from v3.
 
     Parameters
     ----------
@@ -482,7 +529,7 @@ def ensemble_inference(fold_results: list, cfg: dict,
     submission : pd.DataFrame with columns ['Id', 'Label'], sorted by Id
     """
     logger.log("\n" + "=" * 70)
-    logger.log("  AUTO-ENSEMBLE INFERENCE  (5-Fold Softmax Averaging)")
+    logger.log("  AUTO-ENSEMBLE INFERENCE  (5-Fold F1-Weighted TTA Ensemble)")
     logger.log("=" * 70)
 
     # Use the norm params from the first available fold to normalise test data.
@@ -500,12 +547,15 @@ def ensemble_inference(fold_results: list, cfg: dict,
     n_test    = len(test_ds)
     n_classes = cfg["num_classes"]
 
-    # Accumulator: sum of per-fold softmax probability vectors
-    prob_sum = np.zeros((n_test, n_classes), dtype=np.float64)
+    # ── F1-weighted accumulator ───────────────────────────────────────────────
+    # Accumulate F1_i × P_i for each fold; sum of F1_i is tracked separately.
+    weighted_prob_sum = np.zeros((n_test, n_classes), dtype=np.float64)
+    f1_weight_total   = 0.0
 
     for fold_idx, best_f1, norm_params, ckpt_path, _ in fold_results:
         fold_num = fold_idx + 1
-        logger.log(f"  Loading fold {fold_num} checkpoint: {ckpt_path}")
+        logger.log(f"  Loading fold {fold_num} checkpoint: {ckpt_path}  "
+                   f"(Val F1={best_f1:.6f})")
 
         model = ResNet1D(
             in_channels=cfg["in_channels"],
@@ -515,22 +565,35 @@ def ensemble_inference(fold_results: list, cfg: dict,
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model.eval()
 
+        # ── Module 3: TTA per batch ───────────────────────────────────────────
         fold_probs = []
         for signals, _ in test_loader:
-            logits = model(signals.to(device, non_blocking=True))          # (B, C)
-            probs  = F.softmax(logits, dim=1).cpu().numpy()                # (B, C)
-            fold_probs.append(probs)
+            x_orig = signals.to(device, non_blocking=True)          # (B, 16, 300)
 
-        fold_probs_arr = np.concatenate(fold_probs, axis=0)                # (N, C)
-        prob_sum      += fold_probs_arr
+            # TTA variant 1: Original
+            p_orig  = F.softmax(model(x_orig),              dim=1)  # (B, C)
+            # TTA variant 2: Scaled Up  (+5%)
+            p_up    = F.softmax(model(x_orig * 1.05),       dim=1)  # (B, C)
+            # TTA variant 3: Scaled Down (−5%)
+            p_down  = F.softmax(model(x_orig * 0.95),       dim=1)  # (B, C)
 
-        logger.log(f"    Fold {fold_num} probabilities accumulated  "
-                   f"(shape: {fold_probs_arr.shape})")
+            # Average the three TTA softmax distributions for this fold
+            p_tta = (p_orig + p_up + p_down) / 3.0                  # (B, C)
+            fold_probs.append(p_tta.cpu().numpy())
 
-    # Average the accumulated probability distributions
-    n_folds_run   = len(fold_results)
-    avg_probs     = prob_sum / n_folds_run                                 # (N, C)
-    ensemble_preds = avg_probs.argmax(axis=1)                              # (N,)
+        fold_probs_arr = np.concatenate(fold_probs, axis=0)          # (N, C)
+
+        # ── Module 4: F1-weighted accumulation ───────────────────────────────
+        weighted_prob_sum += best_f1 * fold_probs_arr
+        f1_weight_total   += best_f1
+
+        logger.log(f"    Fold {fold_num} TTA probabilities accumulated  "
+                   f"(shape: {fold_probs_arr.shape}, weight: {best_f1:.6f})")
+
+    # ── Final F1-weighted ensemble probability ────────────────────────────────
+    # P_ensemble = Σ(F1_i × P_i) / Σ(F1_i)
+    ensemble_probs = weighted_prob_sum / f1_weight_total              # (N, C)
+    ensemble_preds = ensemble_probs.argmax(axis=1)                    # (N,)
 
     # Build submission DataFrame
     submission = (
@@ -542,7 +605,8 @@ def ensemble_inference(fold_results: list, cfg: dict,
     # Save
     submission.to_csv(cfg["submission_path"], index=False)
 
-    logger.log(f"\n  Ensemble folds used        : {n_folds_run}")
+    logger.log(f"\n  Ensemble folds used        : {len(fold_results)}")
+    logger.log(f"  Total F1 weight            : {f1_weight_total:.6f}")
     logger.log(f"  Total test samples         : {n_test}")
     logger.log(f"  Submission saved to        : {cfg['submission_path']}")
     pred_dist = submission["Label"].value_counts().sort_index()
@@ -602,7 +666,7 @@ def format_confusion_matrix(all_labels, all_preds) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v3")
+    parser = argparse.ArgumentParser(description="HAR 1D-ResNet Training Pipeline v4")
     parser.add_argument("--all-folds",  action="store_true")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
@@ -628,7 +692,7 @@ def main():
 
     header_lines = [
         "=" * 70,
-        "  HAR 1D-ResNet Training Pipeline  (v3)",
+        "  HAR 1D-ResNet Training Pipeline  (v4)",
         "=" * 70,
         f"  Log file    : {os.path.abspath(CFG['log_path'])}",
         f"  Device      : {device}",
@@ -640,14 +704,16 @@ def main():
         ]
     header_lines += [
         f"  Seed        : {CFG['seed']}  (deterministic=True, benchmark=False)",
-        f"  In channels : {CFG['in_channels']}  (6 raw + 2 magnitude)",
+        f"  In channels : {CFG['in_channels']}  (8 base + 8 delta)",
         f"  Epochs      : {CFG['epochs']}",
         f"  Batch       : {CFG['batch_size']}",
         f"  LR          : {CFG['lr']}",
         f"  Weight Decay: {CFG['weight_decay']}",
-        f"  Focal γ     : {CFG['focal_gamma']}",
+        f"  Focal γ     : default={CFG['focal_gamma_default']}  "
+        f"Label2={CFG['focal_gamma_label2']}",
         f"  Patience    : {CFG['patience']}",
         f"  Folds       : {'all 5' if CFG['run_all_folds'] else 'fold 1 only'}",
+        f"  Ensemble    : F1-Weighted TTA (×1.00 / ×1.05 / ×0.95)",
         "=" * 70,
     ]
     for line in header_lines:
@@ -700,12 +766,16 @@ def main():
         logger.log(cm_text)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Module 4: Automated 5-Fold Softmax Averaging Ensemble Inference
+    # Module 3 + 4: Automated F1-Weighted TTA Ensemble Inference
     # ══════════════════════════════════════════════════════════════════════════
     # This block executes automatically after the CV loop.
-    # It sequentially loads fold_1_best.pth … fold_N_best.pth (where N is the
-    # number of folds trained in this run), averages their Softmax distributions,
-    # and writes the final ensemble mapping to submission_v3_ensemble.csv.
+    # For each fold it:
+    #   - Loads the best checkpoint (fold_N_best.pth)
+    #   - Runs TTA inference (X, X×1.05, X×0.95) and averages the three softmax
+    #     distributions to produce a single fold probability vector
+    # Then it combines per-fold vectors using F1-weighted averaging:
+    #   P_ensemble = Σ(F1_i × P_i) / Σ(F1_i)
+    # and writes the final prediction map to submission_v4_ensemble.csv.
     # ──────────────────────────────────────────────────────────────────────────
     if len(fold_results) > 0:
         ensemble_submission = ensemble_inference(
@@ -716,7 +786,7 @@ def main():
         )
 
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v3 complete.")
+    logger.log("  Pipeline v4 complete.")
     logger.log(f"  Ensemble submission ready : {CFG['submission_path']}")
     logger.log("=" * 70)
 

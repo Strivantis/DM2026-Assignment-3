@@ -7,25 +7,36 @@ for the HAR 1D-ResNet project.
 Data format:
   - Each CSV: 300 rows × columns [index, mean_x, mean_y, mean_z, std_x, std_y, std_z, label, file_id]
   - Raw feature shape after loading: (300, 6)
-  - Magnitude features appended: (300, 8)  →  transposed to (8, 300) for 1D-CNN
+  - Magnitude features appended: (300, 8)
+  - Delta (first-derivative) features appended: (300, 16)  →  transposed to (16, 300) for 1D-CNN
   - Train users: User_001 – User_060
   - Test  users: User_061 – User_100
 
-Feature Engineering (v3)
+Feature Engineering (v4)
 -------------------------
   Two rotation-invariant magnitude channels are appended after the raw 6-channel
-  features to decouple activity identification from subject device orientation:
+  features, then 8 first-order temporal delta channels are appended to capture
+  short-term dynamics:
 
   • mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)
   • std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)
 
-  Final channel layout (8 channels):
+  Delta channels (first-order temporal derivative over sequence length 300):
+    X'_t = X_t − X_{t−1}    for t ≥ 1
+    X'_0 = 0                 (zero-padding at the initial boundary)
+
+  Final channel layout (16 channels):
+    ── Base channels (0–7) ──────────────────────────────────────
     [0] mean_x   [1] mean_y   [2] mean_z
     [3] std_x    [4] std_y    [5] std_z
     [6] mean_mag [7] std_mag
+    ── Delta channels (8–15) ────────────────────────────────────
+    [8]  Δmean_x   [9]  Δmean_y   [10] Δmean_z
+    [11] Δstd_x    [12] Δstd_y    [13] Δstd_z
+    [14] Δmean_mag [15] Δstd_mag
 
-Augmentation (v3)
------------------
+Augmentation (v3, unchanged in v4)
+-----------------------------------
   Applied to ALL training samples (global, not minority-only) with probability
   AUG_PROB per technique to prevent subject-signature memorisation.
 
@@ -53,9 +64,10 @@ from sklearn.model_selection import StratifiedGroupKFold
 # ──────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────
-FEATURE_COLS = ["mean_x", "mean_y", "mean_z", "std_x", "std_y", "std_z"]
+FEATURE_COLS  = ["mean_x", "mean_y", "mean_z", "std_x", "std_y", "std_z"]
 RAW_CHANNELS  = len(FEATURE_COLS)   # 6  (original sensor channels)
-N_CHANNELS    = 8                   # 6 raw + 2 magnitude channels
+BASE_CHANNELS = 8                   # 6 raw + 2 magnitude channels
+N_CHANNELS    = 16                  # 8 base + 8 delta channels (v4)
 SEQ_LEN       = 300
 N_CLASSES     = 6
 N_FOLDS       = 5
@@ -114,6 +126,40 @@ def append_magnitude_channels(sig: np.ndarray) -> np.ndarray:
 
 
 # ──────────────────────────────────────────
+# Delta (first-derivative) feature engineering  [v4]
+# ──────────────────────────────────────────
+
+def append_delta_channels(sig: np.ndarray) -> np.ndarray:
+    """
+    Append first-order temporal derivative (delta) channels for all 8 base
+    channels, expanding the feature matrix from 8 to 16 channels.
+
+    Delta computation:
+        X'_t = X_t − X_{t−1}   for t ≥ 1
+        X'_0 = 0                (zero-padding at the initial boundary condition)
+
+    The sequential length of 300 is strictly preserved.
+
+    Parameters
+    ----------
+    sig : np.ndarray, shape (300, 8)
+          Base channels: [mean_x, mean_y, mean_z, std_x, std_y, std_z,
+                          mean_mag, std_mag]
+
+    Returns
+    -------
+    sig_with_deltas : np.ndarray, shape (300, 16)
+          Channels 0–7  : original base channels
+          Channels 8–15 : corresponding first-order delta channels
+    """
+    # delta[0] = 0 (boundary condition), delta[t] = sig[t] - sig[t-1] for t >= 1
+    delta = np.zeros_like(sig)            # (300, 8), dtype inherited from sig
+    delta[1:, :] = sig[1:, :] - sig[:-1, :]   # shape (299, 8)
+
+    return np.concatenate([sig, delta], axis=1)   # (300, 16)
+
+
+# ──────────────────────────────────────────
 # Low-level helpers
 # ──────────────────────────────────────────
 
@@ -123,7 +169,7 @@ def load_all_samples(root_dir: str):
 
     Returns
     -------
-    signals : np.ndarray, shape (N, 300, 8)   – 6 raw + 2 magnitude channels
+    signals : np.ndarray, shape (N, 300, 16)  – 8 base + 8 delta channels
     labels  : np.ndarray, shape (N,)   – integer class index
     groups  : np.ndarray, shape (N,)   – integer user id (for GroupKFold)
     file_ids: np.ndarray, shape (N,)   – original file_id value (for submission)
@@ -146,9 +192,14 @@ def load_all_samples(root_dir: str):
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
         # --- append magnitude channels → (300, 8)
-        sig = append_magnitude_channels(sig_raw)
+        sig_base = append_magnitude_channels(sig_raw)
+        assert sig_base.shape == (SEQ_LEN, BASE_CHANNELS), \
+            f"Unexpected post-magnitude shape {sig_base.shape} for file {path}"
+
+        # --- append delta channels → (300, 16)  [v4]
+        sig = append_delta_channels(sig_base)
         assert sig.shape == (SEQ_LEN, N_CHANNELS), \
-            f"Unexpected post-magnitude shape {sig.shape} for file {path}"
+            f"Unexpected post-delta shape {sig.shape} for file {path}"
 
         # --- label (one label per file, guaranteed consistent)
         lbl = int(df["label"].iloc[0])
@@ -166,7 +217,7 @@ def load_all_samples(root_dir: str):
         groups_list.append(user_id)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 8)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 16)
     labels   = np.array(labels_list,   dtype=np.int64)
     groups   = np.array(groups_list,   dtype=np.int64)
     file_ids = np.array(file_ids_list, dtype=np.int64)
@@ -180,14 +231,14 @@ def compute_normalization_params(signals: np.ndarray):
 
     Parameters
     ----------
-    signals : np.ndarray, shape (N, 300, 8)
+    signals : np.ndarray, shape (N, 300, 16)
 
     Returns
     -------
-    mean : np.ndarray, shape (8,)
-    std  : np.ndarray, shape (8,)
+    mean : np.ndarray, shape (16,)
+    std  : np.ndarray, shape (16,)
     """
-    # Reshape to (N*300, 8) then compute stats along axis 0
+    # Reshape to (N*300, 16) then compute stats along axis 0
     flat = signals.reshape(-1, N_CHANNELS)
     mean = flat.mean(axis=0).astype(np.float32)
     std  = flat.std(axis=0).astype(np.float32)
@@ -198,7 +249,7 @@ def compute_normalization_params(signals: np.ndarray):
 def normalize(signals: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """
     Apply Z-score normalization using *pre-computed* mean/std.
-    signals : (N, 300, 8)  →  returns (N, 300, 8)
+    signals : (N, 300, 16)  →  returns (N, 300, 16)
     """
     return (signals - mean[np.newaxis, np.newaxis, :]) / std[np.newaxis, np.newaxis, :]
 
@@ -223,13 +274,13 @@ def get_fold_splits(signals, labels, groups, fold_idx: int = 0):
 # ──────────────────────────────────────────
 
 def augment_jitter(signal: np.ndarray) -> np.ndarray:
-    """Add Gaussian noise to simulate sensor variance. signal: (300, 8)"""
+    """Add Gaussian noise to simulate sensor variance. signal: (300, 16)"""
     noise = np.random.normal(0.0, JITTER_SIGMA, size=signal.shape).astype(np.float32)
     return signal + noise
 
 
 def augment_scale(signal: np.ndarray) -> np.ndarray:
-    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 8)"""
+    """Multiply by random per-channel scalar in [SCALE_LOW, SCALE_HIGH]. signal: (300, 16)"""
     scale = np.random.uniform(SCALE_LOW, SCALE_HIGH, size=(1, N_CHANNELS)).astype(np.float32)
     return signal * scale
 
@@ -241,11 +292,11 @@ def augment_time_masking(signal: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    signal : np.ndarray, shape (300, 8)
+    signal : np.ndarray, shape (300, 16)
 
     Returns
     -------
-    augmented signal : np.ndarray, shape (300, 8)
+    augmented signal : np.ndarray, shape (300, 16)
     """
     signal = signal.copy()
     mask_len   = np.random.randint(TIME_MASK_MIN, TIME_MASK_MAX + 1)
@@ -261,11 +312,11 @@ def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
 
     Parameters
     ----------
-    signal : np.ndarray, shape (300, 8)
+    signal : np.ndarray, shape (300, 16)
 
     Returns
     -------
-    augmented signal : np.ndarray, shape (300, 8)
+    augmented signal : np.ndarray, shape (300, 16)
     """
     signal       = signal.copy()
     n_mask       = np.random.randint(CHANNEL_MASK_MIN, CHANNEL_MASK_MAX + 1)
@@ -277,7 +328,7 @@ def augment_channel_masking(signal: np.ndarray) -> np.ndarray:
 def apply_augmentation(signal: np.ndarray, label: int) -> np.ndarray:
     """
     Apply all augmentations independently with probability AUG_PROB each.
-    Operates on signal of shape (300, 8) and returns the same shape.
+    Operates on signal of shape (300, 16) and returns the same shape.
 
     Protected Exemption (v3):
       If label == PROTECTED_LABEL (2), Time Masking (Cutout 1D) is
@@ -314,13 +365,13 @@ class HARDataset(Dataset):
 
     Parameters
     ----------
-    signals    : np.ndarray, shape (N, 300, 8)  – already normalised
+    signals    : np.ndarray, shape (N, 300, 16)  – already normalised
     labels     : np.ndarray, shape (N,)
     is_train   : bool  – enables global augmentation for ALL classes during training
     """
 
     def __init__(self, signals: np.ndarray, labels: np.ndarray, is_train: bool = False):
-        self.signals  = signals.astype(np.float32)  # (N, 300, 8)
+        self.signals  = signals.astype(np.float32)  # (N, 300, 16)
         self.labels   = labels.astype(np.int64)
         self.is_train = is_train
 
@@ -328,7 +379,7 @@ class HARDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].copy()   # (300, 8)
+        signal = self.signals[idx].copy()   # (300, 16)
         label  = self.labels[idx]
 
         # Apply augmentation during training for ALL classes (global augmentation).
@@ -338,8 +389,8 @@ class HARDataset(Dataset):
         if self.is_train:
             signal = apply_augmentation(signal, int(label))
 
-        # Transpose: (300, 8)  →  (8, 300)  for 1D-CNN input (C, L)
-        signal = signal.T  # (8, 300)
+        # Transpose: (300, 16)  →  (16, 300)  for 1D-CNN input (C, L)
+        signal = signal.T  # (16, 300)
 
         return torch.from_numpy(signal), torch.tensor(label, dtype=torch.long)
 
@@ -350,8 +401,8 @@ class HARTestDataset(Dataset):
 
     Parameters
     ----------
-    signals  : np.ndarray, shape (N, 300, 8)  – already normalised
-    file_ids : np.ndarray, shape (N,)          – for submission mapping
+    signals  : np.ndarray, shape (N, 300, 16)  – already normalised
+    file_ids : np.ndarray, shape (N,)           – for submission mapping
     """
 
     def __init__(self, signals: np.ndarray, file_ids: np.ndarray):
@@ -362,7 +413,7 @@ class HARTestDataset(Dataset):
         return len(self.signals)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx].T.copy()   # (8, 300)
+        signal = self.signals[idx].T.copy()   # (16, 300)
         return torch.from_numpy(signal), self.file_ids[idx]
 
 
@@ -410,7 +461,7 @@ def load_test_samples(root_dir: str):
 
     Returns
     -------
-    signals  : np.ndarray, shape (N, 300, 8)   – 6 raw + 2 magnitude channels
+    signals  : np.ndarray, shape (N, 300, 16)  – 8 base + 8 delta channels
     file_ids : np.ndarray, shape (N,)
     """
     csv_files = sorted(glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True))
@@ -428,14 +479,17 @@ def load_test_samples(root_dir: str):
             f"Unexpected shape {sig_raw.shape} for file {path}"
 
         # Append magnitude channels → (300, 8)
-        sig = append_magnitude_channels(sig_raw)
+        sig_base = append_magnitude_channels(sig_raw)
+
+        # Append delta channels → (300, 16)  [v4]
+        sig = append_delta_channels(sig_base)
 
         file_id = int(df["file_id"].iloc[0])
 
         signals_list.append(sig)
         file_ids_list.append(file_id)
 
-    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 8)
+    signals  = np.stack(signals_list,  axis=0)          # (N, 300, 16)
     file_ids = np.array(file_ids_list, dtype=np.int64)
 
     return signals, file_ids
