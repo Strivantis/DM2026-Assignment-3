@@ -474,8 +474,20 @@ def build_fold_datasets(train_root: str,
                                    train_orig_s2, is_train=True)
         val_dataset   = HARDataset(val_sig_s2,   val_lbl_s2,
                                    val_orig_s2,   is_train=False)
+
+    elif mode == "flat":
+        # v10: Flat 6-class global classifier – use original labels 0-5 directly,
+        # no merging, no filtering.
+        n_classes_out = N_CLASSES   # 6
+        class_counts  = np.bincount(train_labels_orig, minlength=N_CLASSES)
+
+        train_dataset = HARDataset(train_signals_norm, train_labels_orig,
+                                   train_labels_orig, is_train=True)
+        val_dataset   = HARDataset(val_signals_norm,   val_labels_orig,
+                                   val_labels_orig,   is_train=False)
+
     else:
-        raise ValueError(f"Unknown mode '{mode}'. Choose 'stage1' or 'stage2'.")
+        raise ValueError(f"Unknown mode '{mode}'. Choose 'stage1', 'stage2', or 'flat'.")
 
     return train_dataset, val_dataset, (mean, std), class_counts, n_classes_out
 

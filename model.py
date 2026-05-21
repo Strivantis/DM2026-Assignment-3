@@ -1,40 +1,49 @@
 """
 model.py
 --------
-InceptionTime architecture for Human Activity Recognition (HAR).
+SE-InceptionTime architecture for Human Activity Recognition (HAR) – v10.
 
 Input  : (Batch, 8, 300)  – 8 stable channels × 300 timesteps
                               [mean_x, mean_y, mean_z, std_x, std_y, std_z, mean_mag, std_mag]
-Output : (Batch, num_classes)  – variable logit vector
+Output : (Batch, 6)  – flat 6-class logit vector (L0, L1, L2, L3, L4, L5)
 
-Architecture outline (v9, nb_filters=64)
+Architecture outline (v10, nb_filters=64)
 ──────────────────────────────────────────
-  InceptionTime Block (× N stacked):
+  SE-InceptionTime Block (× N stacked):
     Input branches in parallel:
       1. Bottleneck Conv1d → Short-range Conv1d  (kernel_size=3)
       2. Bottleneck Conv1d → Mid-range  Conv1d  (kernel_size=11)
       3. Bottleneck Conv1d → Long-range Conv1d  (kernel_size=21)
       4. MaxPool1d → Bottleneck Conv1d           (passthrough branch)
     Concatenate all 4 branch outputs along channel dim → BN → ReLU
+    Squeeze-and-Excitation block on the concatenated output (r=16 reduction)
 
   Residual shortcut: every 3 blocks a 1×1 Conv shortcut is added
   to the skip connection (ResNet-style), helping gradient flow.
 
   Classifier Head:
     Global Average Pooling (B, C, L) → (B, C)
-    Stage 1: Dropout(0.4) → Linear → num_classes
-    Stage 2: Dropout(0.4) → Linear → 1  (BCEWithLogitsLoss)
+    Dropout(0.4) → Linear → 6 (flat 6-class logits)
 
-v9 Changes
+v10 Changes
 ──────────
-  • Completely decommissions all ResNet and CRNN/BiGRU components.
-  • Introduces parallelised multi-scale InceptionTime blocks.
-  • Identical structural block for Stage 1 generalist and Stage 2 specialist.
-  • Residual shortcuts every 3 blocks for stable deep training.
+  • Completely decommissions all hierarchical Stage 1 / Stage 2 components.
+  • Flat 6-class global output head replacing dual-stage logit outputs.
+  • Injects a 1D Squeeze-and-Excitation (SE) block after every Inception block.
+  • Increases nb_filters default to 64 for richer feature extraction.
 
-Regularisation (v9)
+Squeeze-and-Excitation Block (1D)
+───────────────────────────────────
+  Squeeze: Global Average Pooling over temporal axis (B, C, L) → (B, C)
+  Excitation:
+    Linear(C → C//r) → ReLU
+    Linear(C//r → C) → Sigmoid
+  Scale: multiply channel-wise attention weights back onto feature maps
+
+Regularisation (v10)
 ────────────────────
   • BN after each inception block concatenation.
+  • SE channel attention per block.
   • Dropout(0.4) in classifier head.
   • Kaiming / Xavier weight initialisation.
 """
@@ -45,12 +54,57 @@ import torch.nn.functional as F
 
 
 # ──────────────────────────────────────────
-# Inception Block (single block)
+# 1D Squeeze-and-Excitation Block
 # ──────────────────────────────────────────
 
-class InceptionBlock1D(nn.Module):
+class SEBlock1D(nn.Module):
     """
-    Single multi-scale Inception block for 1-D time-series.
+    1D Squeeze-and-Excitation channel attention block.
+
+    Squeeze : Global Average Pooling over the temporal axis.
+    Excite  : Two-layer bottleneck MLP with ReLU + Sigmoid.
+    Scale   : Re-calibrate feature maps channel-wise.
+
+    Parameters
+    ----------
+    channels : int   – number of input/output feature map channels
+    reduction : int  – bottleneck reduction ratio r (default 16)
+    """
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        bottleneck = max(channels // reduction, 1)
+        self.gap = nn.AdaptiveAvgPool1d(1)           # (B, C, L) → (B, C, 1)
+        self.fc1 = nn.Linear(channels, bottleneck, bias=True)
+        self.fc2 = nn.Linear(bottleneck, channels,  bias=True)
+
+        # Weight init
+        nn.init.kaiming_normal_(self.fc1.weight, nonlinearity="relu")
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, C, L)
+        → (B, C, L)  – channel-wise re-calibrated feature maps
+        """
+        # Squeeze: (B, C, L) → (B, C, 1) → (B, C)
+        s = self.gap(x).squeeze(-1)                  # (B, C)
+        # Excite: two FC layers with bottleneck
+        e = F.relu(self.fc1(s), inplace=True)        # (B, C//r)
+        e = torch.sigmoid(self.fc2(e))               # (B, C)
+        # Scale: broadcast (B, C) → (B, C, 1) and multiply
+        return x * e.unsqueeze(-1)                   # (B, C, L)
+
+
+# ──────────────────────────────────────────
+# SE-Inception Block (single block)
+# ──────────────────────────────────────────
+
+class SEInceptionBlock1D(nn.Module):
+    """
+    Multi-scale Inception block with integrated 1D SE channel attention.
 
     Four parallel branches:
         1. bottleneck → Conv1d(k=3)
@@ -59,18 +113,20 @@ class InceptionBlock1D(nn.Module):
         4. MaxPool1d(k=3) → pointwise Conv1d (bottleneck passthrough)
 
     All branches produce `nb_filters` output channels.
-    Their outputs are concatenated → (B, 4*nb_filters, L) → BN → ReLU.
+    Concatenated → (B, 4*nb_filters, L) → BN → ReLU → SE block.
 
     Parameters
     ----------
     in_channels : int   – input channel count
-    nb_filters  : int   – output channels per branch (default 32)
+    nb_filters  : int   – output channels per branch (default 64)
     bottleneck  : int   – bottleneck reduction channels (default 32)
+    se_reduction : int  – SE bottleneck ratio r (default 16)
     """
 
     def __init__(self, in_channels: int,
-                 nb_filters: int  = 32,
-                 bottleneck: int  = 32):
+                 nb_filters:   int = 64,
+                 bottleneck:   int = 32,
+                 se_reduction: int = 16):
         super().__init__()
 
         # Bottleneck that feeds the three Conv branches
@@ -86,83 +142,94 @@ class InceptionBlock1D(nn.Module):
                                     kernel_size=21, padding=10, bias=False)
 
         # MaxPool passthrough branch → pointwise conv
-        self.maxpool    = nn.MaxPool1d(kernel_size=3, stride=1, padding=1)
-        self.conv_pool  = nn.Conv1d(in_channels, nb_filters,
-                                    kernel_size=1, bias=False)
+        self.maxpool   = nn.MaxPool1d(kernel_size=3, stride=1, padding=1)
+        self.conv_pool = nn.Conv1d(in_channels, nb_filters,
+                                   kernel_size=1, bias=False)
 
         # BN applied after concatenation of all 4 branches
-        self.bn         = nn.BatchNorm1d(nb_filters * 4)
+        hidden_dim = nb_filters * 4
+        self.bn    = nn.BatchNorm1d(hidden_dim)
+
+        # SE block applied on the BN+ReLU output
+        self.se    = SEBlock1D(hidden_dim, reduction=se_reduction)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x : (B, in_channels, L)
-        → (B, nb_filters*4, L)
+        → (B, nb_filters*4, L)  – after BN + ReLU + SE
         """
-        bottleneck_out = self.bottleneck_conv(x)   # (B, bottleneck, L)
+        bottleneck_out = self.bottleneck_conv(x)    # (B, bottleneck, L)
 
-        b1 = self.conv_short(bottleneck_out)        # (B, nb_filters, L)
-        b2 = self.conv_mid(bottleneck_out)          # (B, nb_filters, L)
-        b3 = self.conv_long(bottleneck_out)         # (B, nb_filters, L)
-        b4 = self.conv_pool(self.maxpool(x))       # (B, nb_filters, L)
+        b1 = self.conv_short(bottleneck_out)         # (B, nb_filters, L)
+        b2 = self.conv_mid(bottleneck_out)           # (B, nb_filters, L)
+        b3 = self.conv_long(bottleneck_out)          # (B, nb_filters, L)
+        b4 = self.conv_pool(self.maxpool(x))        # (B, nb_filters, L)
 
-        out = torch.cat([b1, b2, b3, b4], dim=1)   # (B, nb_filters*4, L)
-        return F.relu(self.bn(out), inplace=True)
+        out = torch.cat([b1, b2, b3, b4], dim=1)    # (B, nb_filters*4, L)
+        out = F.relu(self.bn(out), inplace=True)     # (B, nb_filters*4, L)
+        out = self.se(out)                           # (B, nb_filters*4, L)  SE attention
+        return out
 
 
 # ──────────────────────────────────────────
-# InceptionTime Model
+# SE-InceptionTime Model (v10, flat 6-class)
 # ──────────────────────────────────────────
 
 class InceptionTime1D(nn.Module):
     """
-    InceptionTime: stacked Inception blocks with residual shortcuts.
+    SE-InceptionTime: stacked SE-Inception blocks with residual shortcuts.
 
-    Shared structural backbone for both Stage 1 and Stage 2.
+    v10 flat 6-class global classifier replacing the v9 hierarchical two-stage design.
+    Each Inception block is followed by a 1D Squeeze-and-Excitation channel
+    attention block for adaptive feature recalibration.
 
     Parameters
     ----------
-    in_channels : int   – sensor channels input (v9 default: 8)
-    num_classes : int   – output classes (5 for Stage1, 1 for Stage2)
-    nb_filters  : int   – output channels per branch per block (default 32)
-    bottleneck  : int   – bottleneck projection size      (default 32)
-    depth       : int   – number of Inception blocks stacked (default 6)
-    dropout_p   : float – classifier head dropout probability (default 0.4)
+    in_channels  : int   – sensor channels input (v10 default: 8)
+    num_classes  : int   – output classes (v10 flat: 6)
+    nb_filters   : int   – output channels per branch per block (default 64)
+    bottleneck   : int   – bottleneck projection size           (default 32)
+    depth        : int   – number of SE-Inception blocks stacked (default 6)
+    dropout_p    : float – classifier head dropout probability   (default 0.4)
+    se_reduction : int   – SE channel reduction ratio r          (default 16)
 
-    Intermediate shapes (nb_filters=32, depth=6, input (B, 8, 300)):
-      Block 0  : InceptionBlock(8  → 4×32=128)   (B, 128, 300)
-      Block 1  : InceptionBlock(128→128)           (B, 128, 300)
-      Block 2  : InceptionBlock(128→128) + residual shortcut from block 0 input
-      Block 3  : InceptionBlock(128→128)           (B, 128, 300)
-      Block 4  : InceptionBlock(128→128)           (B, 128, 300)
-      Block 5  : InceptionBlock(128→128) + residual shortcut from block 3 input
-      GAP (seq L=300 → 1)                         (B, 128)
-      head → (B, num_classes)
-
-    Total parameters: ~350 K (Stage1) / ~350 K (Stage2) – well within 8 GB VRAM.
+    Intermediate shapes (nb_filters=64, depth=6, input (B, 8, 300)):
+      Block 0  : SEInceptionBlock(8   → 4×64=256) + SE   (B, 256, 300)
+      Block 1  : SEInceptionBlock(256 → 256) + SE          (B, 256, 300)
+      Block 2  : SEInceptionBlock(256 → 256) + SE  + residual shortcut
+      Block 3  : SEInceptionBlock(256 → 256) + SE          (B, 256, 300)
+      Block 4  : SEInceptionBlock(256 → 256) + SE          (B, 256, 300)
+      Block 5  : SEInceptionBlock(256 → 256) + SE  + residual shortcut
+      GAP (seq L=300 → 1)                                  (B, 256)
+      Dropout(0.4) → Linear(256 → 6)                       (B, 6)
     """
 
     def __init__(self,
-                 in_channels: int   = 8,
-                 num_classes: int   = 5,
-                 nb_filters:  int   = 32,
-                 bottleneck:  int   = 32,
-                 depth:       int   = 6,
-                 dropout_p:   float = 0.4):
+                 in_channels:  int   = 8,
+                 num_classes:  int   = 6,
+                 nb_filters:   int   = 64,
+                 bottleneck:   int   = 32,
+                 depth:        int   = 6,
+                 dropout_p:    float = 0.4,
+                 se_reduction: int   = 16):
         super().__init__()
 
         self.depth      = depth
-        hidden_dim      = nb_filters * 4   # 128 when nb_filters=32
+        hidden_dim      = nb_filters * 4   # 256 when nb_filters=64
 
-        # Build `depth` inception blocks
+        # Build `depth` SE-Inception blocks
         self.inception_blocks = nn.ModuleList()
         ch = in_channels
         for i in range(depth):
             self.inception_blocks.append(
-                InceptionBlock1D(ch, nb_filters=nb_filters, bottleneck=bottleneck))
+                SEInceptionBlock1D(ch,
+                                   nb_filters=nb_filters,
+                                   bottleneck=bottleneck,
+                                   se_reduction=se_reduction))
             ch = hidden_dim
 
         # Residual shortcut projections: applied every 3 blocks
-        # Shortcut maps input to the 3-block sub-sequence to hidden_dim channels
+        # Shortcut maps the 3-block segment input to hidden_dim channels
         self.shortcuts = nn.ModuleList()
         for res_start in range(0, depth, 3):
             in_ch_res = in_channels if res_start == 0 else hidden_dim
@@ -171,7 +238,7 @@ class InceptionTime1D(nn.Module):
                 nn.BatchNorm1d(hidden_dim),
             ))
 
-        # Classifier head
+        # Classifier head – flat 6-class
         self.gap  = nn.AdaptiveAvgPool1d(1)   # (B, C, L) → (B, C, 1)
         self.head = nn.Sequential(
             nn.Dropout(p=dropout_p),
@@ -202,10 +269,9 @@ class InceptionTime1D(nn.Module):
 
         Returns
         -------
-        logits : (B, num_classes)
+        logits : (B, num_classes)  – raw 6-class logits
         """
-        residual_input = x          # save for first shortcut (at block 3)
-        shortcut_idx   = 0
+        shortcut_idx = 0
 
         for block_idx, block in enumerate(self.inception_blocks):
             if block_idx % 3 == 0:
@@ -223,7 +289,7 @@ class InceptionTime1D(nn.Module):
         # Global average pooling: (B, C, L) → (B, C)
         x = self.gap(x).squeeze(-1)
 
-        # Classifier projection
+        # Flat 6-class projection
         return self.head(x)   # (B, num_classes)
 
 
@@ -234,26 +300,17 @@ class InceptionTime1D(nn.Module):
 def _test_model():
     dummy = torch.randn(32, 8, 300)
 
-    # Stage 1: 5-class generalist
-    model_s1 = InceptionTime1D(in_channels=8, num_classes=5,
-                                nb_filters=32, bottleneck=32, depth=6)
-    model_s1.eval()
+    # v10: flat 6-class SE-InceptionTime
+    model_v10 = InceptionTime1D(in_channels=8, num_classes=6,
+                                 nb_filters=64, bottleneck=32, depth=6,
+                                 se_reduction=16)
+    model_v10.eval()
     with torch.no_grad():
-        out_s1 = model_s1(dummy)
-    assert out_s1.shape == (32, 5), f"Stage1 unexpected shape: {out_s1.shape}"
+        out = model_v10(dummy)
+    assert out.shape == (32, 6), f"v10 unexpected output shape: {out.shape}"
 
-    # Stage 2: 1-logit specialist (BCEWithLogitsLoss)
-    model_s2 = InceptionTime1D(in_channels=8, num_classes=1,
-                                nb_filters=32, bottleneck=32, depth=6)
-    model_s2.eval()
-    with torch.no_grad():
-        out_s2 = model_s2(dummy)
-    assert out_s2.shape == (32, 1), f"Stage2 unexpected shape: {out_s2.shape}"
-
-    n1 = sum(p.numel() for p in model_s1.parameters() if p.requires_grad)
-    n2 = sum(p.numel() for p in model_s2.parameters() if p.requires_grad)
-    print(f"InceptionTime1D (v9) Stage1 — output: {out_s1.shape}  |  Params: {n1:,}")
-    print(f"InceptionTime1D (v9) Stage2 — output: {out_s2.shape}  |  Params: {n2:,}")
+    n_params = sum(p.numel() for p in model_v10.parameters() if p.requires_grad)
+    print(f"SE-InceptionTime1D (v10) — output: {out.shape}  |  Params: {n_params:,}")
     print("All shape assertions passed.")
 
 

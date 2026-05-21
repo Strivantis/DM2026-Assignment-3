@@ -30,7 +30,6 @@ def run_eda():
     is_label_consistent = True
     has_nan = False
     
-    # 為了節省時間與記憶體，如果檔案超過 10000 個，我們全讀也無妨 (資料很輕量)
     for file_path in tqdm(train_files, desc="讀取 Train CSV"):
         df = pd.read_csv(file_path)
         
@@ -45,10 +44,10 @@ def run_eda():
         if len(unique_labels) > 1:
             is_label_consistent = False
         
-        # 紀錄這個檔案的標籤 (假設一致，取第一個)
+        # 紀錄這個檔案的標籤
         file_label_mapping[file_id] = unique_labels[0]
         
-        # 將資料加入總表以計算特徵分佈
+        # 將資料加入總表
         df_list.append(df)
 
     full_train_df = pd.concat(df_list, ignore_index=True)
@@ -79,14 +78,40 @@ def run_eda():
     stats_df = full_train_df[features].describe().T
     print(stats_df[['mean', 'std', 'min', 'max']])
     
-    # 繪製類別分佈圖
-    plt.figure(figsize=(10, 5))
-    sns.barplot(x=label_counts.index, y=label_counts.values, palette='viridis')
-    plt.title('Sequence Label Distribution (Train)')
-    plt.xlabel('Label')
-    plt.ylabel('Number of Sequences (Files)')
+    # ==========================================
+    # 修改後的繪圖部分：動態新增百分比標籤
+    # ==========================================
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(x=label_counts.index, y=label_counts.values, palette='viridis')
+    
+    # 計算總序列數來做為百分比分母
+    total_sequences = label_counts.sum()
+    
+    # 走訪每一個長條圖柱子，並在上方標註百分比
+    for p in ax.patches:
+        height = p.get_height()  # 取得當前柱子代表的數量值
+        percentage = (height / total_sequences) * 100  # 計算百分比
+        
+        # 在柱子上方寫入文字標籤
+        ax.annotate(f'{percentage:.2f}%', 
+                    (p.get_x() + p.get_width() / 2., height),  # 文字座標點 (柱子中央, 柱子頂端)
+                    ha='center',                       # 水平居中
+                    va='bottom',                       # 垂直靠底 (在點的上方)
+                    fontsize=11,                       # 字體大小
+                    fontweight='bold',                 # 字體加粗
+                    xytext=(0, 5),                     # 文字往上微調 5 個像素像素，避免壓到柱子線
+                    textcoords='offset points')
+        
+    plt.title('Sequence Label Distribution with Percentage (Train)', fontsize=14, pad=15)
+    plt.xlabel('Label', fontsize=12)
+    plt.ylabel('Number of Sequences (Files)', fontsize=12)
+    
+    # 稍微調整 Y 軸的最大範圍，避免最高的百分比文字被圖表邊框切到
+    plt.ylim(0, max(label_counts.values) * 1.1)
+    
+    plt.tight_layout()
     plt.savefig('label_distribution.png')
-    print("\n📈 已生成類別分佈圖：'label_distribution.png'")
+    print("\n📈 已生成含有百分比的類別分佈圖：'label_distribution.png'")
     print("="*40)
 
 if __name__ == "__main__":
