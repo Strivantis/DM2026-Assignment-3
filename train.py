@@ -1,12 +1,14 @@
 """
 train.py
 --------
-Hierarchical Two-Stage Training Pipeline for HAR CRNN (v8).
+Hierarchical Two-Stage Training Pipeline for HAR InceptionTime (v9).
 
 Architecture
 ────────────
-  Stage 1 (Generalist)  : 5-class CRNN1D  – classifies L0, L1_2_Merged, L3, L4, L5
-  Stage 2 (Specialist)  : Binary  CRNN1D  – distinguishes L1 vs L2 among merged samples
+  Stage 1 (Generalist)  : 5-class InceptionTime1D – classifies L0, L1_2_Merged, L3, L4, L5
+  Stage 2 (Specialist)  : Heterogeneous Dual-Engine Ensemble
+                            Engine A – Binary InceptionTime1D (L1 vs L2, BCEWithLogitsLoss)
+                            Engine B – GBDT (LightGBM) on handcrafted tabular features
 
 Training Phases
 ───────────────
@@ -19,21 +21,18 @@ Training Phases
     • Saves: checkpoints/stage1_fold_{n}_best.pth
 
   Phase B – Stage 2 Specialist (L1 vs L2):
+    Engine A (Neural Network):
     • 5-fold CV on L1/L2 samples only
     • BCEWithLogitsLoss with computed pos_weight = count(L1) / count(L2)
-    • Multi-Sample Dropout (5×, p=0.5) in classifier head
-    • No Mixup (specialist binary task)
     • AdamW + CosineAnnealingLR
     • Early stop on validation Macro F1 (patience=25)
     • Saves: checkpoints/stage2_fold_{n}_best.pth
 
-  Phase C – Semi-Supervised Pseudo-Labeling Fine-Tuning:
-    • Collect 5-fold ensemble test probabilities (Stage 1 TTA)
-    • Isolate high-confidence samples (max softmax > 0.95)
-    • Collect Stage 2 ensemble sigmoid for S1-routed test samples
-    • Combine high-confidence pseudo-labeled samples with full training pool
-    • Fine-tune all 5-fold checkpoints for 12 epochs at LR=3e-5
-    • Overwrites the Phase A / Phase B checkpoints in-place
+    Engine B (GBDT):
+    • Extracts tabular statistical features from std_mag channel (channel index 7):
+        10th / 25th / 75th / 90th percentiles, Kurtosis, Skewness, Zero-crossing rate
+    • Also extracts mean/std summaries across all 8 channels
+    • Trains one LightGBM binary classifier per CV fold
 
 Inference (Hierarchical Routing)
 ─────────────────────────────────
@@ -41,15 +40,25 @@ Inference (Hierarchical Routing)
      → F1-weighted softmax averaging → argmax → 5-class prediction
   2. If predicted class == 1 (L1_2_Merged) → route to Stage 2
      Else → accept Stage 1 prediction; map back to original label space
-  3. Stage 2 specialist runs routed samples through 5 folds × TTA × Sigmoid
-     → F1-weighted probability averaging → threshold 0.5 → L1 or L2
-  4. Recombine and write: submission_v8_crnn.csv
+  3. Stage 2 dual-engine inference on routed samples:
+        P_CNN  = Engine A InceptionTime sigmoid probabilities (F1-weighted TTA)
+        P_GBDT = Engine B LightGBM probability of L2
+        P_final = 0.5 × P_CNN + 0.5 × P_GBDT
+        threshold → L1 or L2
+  4. Recombine and write: submission_v9_inception.csv
+
+Test-Time Feature Normalization (Domain Adaptation)
+────────────────────────────────────────────────────
+  Test data is NOT normalised with training global mean/std.
+  Instead the test set's own batch mean and std are computed at inference
+  time and used for intrinsic Z-score standardisation, resolving
+  cross-subject covariate shift without any labels.
 
 Usage
 ─────
     conda activate PyTorch
-    python train.py               # fold 1 only (Phase A + Phase B + Phase C + inference)
-    python train.py --all-folds   # full 5-fold CV + Phase C + ensemble inference
+    python train.py               # fold 1 only (Phase A + Phase B + inference)
+    python train.py --all-folds   # full 5-fold CV + ensemble inference
 
 DO NOT run this script automatically – see task constraints.
 """
@@ -66,19 +75,38 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
+from scipy.stats import kurtosis as scipy_kurtosis, skew as scipy_skew
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     f1_score, accuracy_score, classification_report, confusion_matrix
 )
 
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+
+if not LGBM_AVAILABLE:
+    try:
+        import xgboost as xgb
+        XGB_AVAILABLE = True
+    except ImportError:
+        XGB_AVAILABLE = False
+        raise ImportError(
+            "Neither LightGBM nor XGBoost is installed. "
+            "Please install one: pip install lightgbm  OR  pip install xgboost")
+else:
+    XGB_AVAILABLE = False
+
 from dataset import (
     build_fold_datasets, build_test_dataset,
-    load_all_samples, get_fold_splits,
+    load_all_samples, load_test_samples, get_fold_splits,
     normalize, remap_labels_stage1, HARDataset,
     N_FOLDS, N_CLASSES, N_CLASSES_S1, N_CLASSES_S2,
     STAGE1_MAP, STAGE2_MAP,
 )
-from model import CRNN1D
+from model import InceptionTime1D
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -109,7 +137,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v8_crnn.csv",
+    "submission_path"   : "./submission_v9_inception.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -128,13 +156,11 @@ CFG = {
     # Early stopping ──────────────────────────────────────────────────────────
     "patience"          : 25,
 
-    # Model ───────────────────────────────────────────────────────────────────
-    "in_channels"       : 8,           # v8: 8 stable channels
-    "base_filters"      : 64,          # CNN base width
-
-    # BiGRU hidden sizes (per direction; bidirectional doubles output dim)
-    "gru_hidden_s1"     : 128,         # Stage 1 generalist BiGRU hidden
-    "gru_hidden_s2"     : 64,          # Stage 2 specialist BiGRU hidden (halved)
+    # Model (InceptionTime) ───────────────────────────────────────────────────
+    "in_channels"       : 8,       # v9: 8 stable channels
+    "nb_filters"        : 32,      # output channels per branch per block
+    "bottleneck"        : 32,      # bottleneck projection dim
+    "depth"             : 6,       # number of stacked Inception blocks
 
     # Stage-specific class counts
     "num_classes_s1"    : N_CLASSES_S1,   # 5
@@ -153,10 +179,9 @@ CFG = {
     # Cross-validation ────────────────────────────────────────────────────────
     "run_all_folds"     : False,
 
-    # Phase C Pseudo-Labeling ─────────────────────────────────────────────────
-    "pseudo_label_conf_thresh" : 0.95,    # minimum max-softmax to accept as pseudo-label
-    "pseudo_label_lr"          : 3e-5,    # 1/10th of baseline LR (3e-4 → 3e-5)
-    "pseudo_label_epochs"      : 12,      # fine-tuning epochs (within 10–15 range)
+    # GBDT Engine B weights for ensemble (0.5 each)
+    "gbdt_weight"       : 0.5,
+    "cnn_weight"        : 0.5,
 
     # Reproducibility ─────────────────────────────────────────────────────────
     "seed"              : 42,
@@ -315,6 +340,119 @@ class EarlyStopping:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Module 4: Tabular Feature Extractor (Stage 2 – Engine B)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Channel index for std_mag (the 8th channel, 0-indexed = 7)
+STD_MAG_CHANNEL = 7
+
+
+def zero_crossing_rate(signal_1d: np.ndarray) -> float:
+    """Compute zero-crossing rate for a 1-D signal of length L."""
+    signs = np.sign(signal_1d)
+    # Replace 0 sign with previous sign to avoid ambiguity
+    for i in range(1, len(signs)):
+        if signs[i] == 0:
+            signs[i] = signs[i - 1]
+    crossings = np.sum(np.diff(signs) != 0)
+    return float(crossings) / max(len(signal_1d) - 1, 1)
+
+
+def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
+    """
+    Extract a handcrafted tabular feature vector from a batch of
+    raw 300-timestep signal windows.
+
+    Parameters
+    ----------
+    signals_np : np.ndarray, shape (N, 8, 300)
+        The 8-channel × 300-timestep windows.
+
+    Returns
+    -------
+    features : np.ndarray, shape (N, n_features)
+
+    Feature layout
+    ──────────────
+    std_mag channel (channel 7) – 7 features:
+        p10, p25, p75, p90  (4 percentiles)
+        kurtosis            (1)
+        skewness            (1)
+        zero_crossing_rate  (1)
+
+    All 8 channels – per-channel mean + per-channel std  (8×2 = 16 features)
+
+    Total: 7 + 16 = 23 features per sample.
+    """
+    N = signals_np.shape[0]
+    feature_rows = []
+
+    for i in range(N):
+        sample = signals_np[i]           # (8, 300)
+        std_mag = sample[STD_MAG_CHANNEL]  # (300,)
+
+        # ── std_mag-specific features ────────────────────────────────────────
+        p10 = float(np.percentile(std_mag, 10))
+        p25 = float(np.percentile(std_mag, 25))
+        p75 = float(np.percentile(std_mag, 75))
+        p90 = float(np.percentile(std_mag, 90))
+        kurt = float(scipy_kurtosis(std_mag, fisher=True, bias=True))
+        skew = float(scipy_skew(std_mag, bias=True))
+        zcr  = zero_crossing_rate(std_mag)
+
+        # ── All-channel summary features ────────────────────────────────────
+        ch_mean = sample.mean(axis=1)   # (8,)
+        ch_std  = sample.std(axis=1)    # (8,)
+
+        row = np.array([p10, p25, p75, p90, kurt, skew, zcr,
+                        *ch_mean.tolist(), *ch_std.tolist()],
+                       dtype=np.float32)
+        feature_rows.append(row)
+
+    return np.stack(feature_rows, axis=0)   # (N, 23)
+
+
+def build_gbdt_model():
+    """
+    Instantiate and return a LightGBM (preferred) or XGBoost binary classifier
+    with sane defaults for the L1/L2 imbalanced task.
+    """
+    if LGBM_AVAILABLE:
+        model = lgb.LGBMClassifier(
+            n_estimators    = 500,
+            learning_rate   = 0.05,
+            max_depth       = 6,
+            num_leaves      = 31,
+            min_child_samples= 20,
+            subsample       = 0.8,
+            colsample_bytree= 0.8,
+            reg_alpha       = 0.1,
+            reg_lambda      = 1.0,
+            random_state    = 42,
+            verbose         = -1,
+            n_jobs          = -1,
+        )
+        backend = "LightGBM"
+    else:
+        model = xgb.XGBClassifier(
+            n_estimators    = 500,
+            learning_rate   = 0.05,
+            max_depth       = 6,
+            subsample       = 0.8,
+            colsample_bytree= 0.8,
+            reg_alpha       = 0.1,
+            reg_lambda      = 1.0,
+            use_label_encoder= False,
+            eval_metric     = "logloss",
+            random_state    = 42,
+            verbosity       = 0,
+            n_jobs          = -1,
+        )
+        backend = "XGBoost"
+    return model, backend
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Phase A helpers – Stage 1 (5-class generalist, Focal Loss + Mixup)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -371,7 +509,7 @@ def evaluate_s1(model, loader, criterion, device):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase B helpers – Stage 2 (binary specialist, BCEWithLogitsLoss + MSD)
+# Phase B helpers – Stage 2 (binary specialist, BCEWithLogitsLoss)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_bce_loss(class_counts: np.ndarray, device: torch.device) -> nn.BCEWithLogitsLoss:
@@ -383,7 +521,6 @@ def build_bce_loss(class_counts: np.ndarray, device: torch.device) -> nn.BCEWith
     """
     count_neg = float(class_counts[0])   # L1 mapped to binary 0
     count_pos = float(class_counts[1])   # L2 mapped to binary 1
-    # Guard against zero counts (should not happen, but just in case)
     if count_pos < 1.0:
         count_pos = 1.0
     pos_weight = torch.tensor([count_neg / count_pos],
@@ -393,19 +530,8 @@ def build_bce_loss(class_counts: np.ndarray, device: torch.device) -> nn.BCEWith
 
 def train_one_epoch_s2(model, loader, criterion, optimizer, device) -> float:
     """
-    Train Stage 2 for one epoch with BCEWithLogitsLoss + Multi-Sample Dropout.
-
-    When the model is in training mode with use_multi_sample_dropout=True,
-    model(signals) returns a list of k logit tensors (each (B, 1)).
-    We compute the BCE loss for each dropout sample independently and
-    optimise against their arithmetic mean:
-
-        Loss_final = (1/k) * Σ Loss(Output_k, Target)
-
-    During eval (evaluate_s2), the model returns a single averaged (B, 1)
-    tensor regardless of MSD setting – so evaluate_s2 needs no modification.
-
-    No Mixup – binary specialist task requires clean decision boundaries.
+    Train Stage 2 Engine A (InceptionTime) for one epoch.
+    model(signals) returns (B, 1) logit tensor.
     """
     model.train()
     running_loss = 0.0
@@ -415,15 +541,8 @@ def train_one_epoch_s2(model, loader, criterion, optimizer, device) -> float:
         labels  = labels.to(device,  non_blocking=True).float()  # (B,)
 
         optimizer.zero_grad()
-        output = model(signals)
-
-        if isinstance(output, list):
-            # Multi-Sample Dropout path: output is list of k tensors, each (B, 1)
-            loss = sum(criterion(o.squeeze(-1), labels) for o in output) / len(output)
-        else:
-            # Fallback for standard single-output (should not trigger for Stage 2)
-            loss = criterion(output.squeeze(-1), labels)
-
+        output = model(signals)   # (B, 1)
+        loss   = criterion(output.squeeze(-1), labels)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -436,10 +555,8 @@ def train_one_epoch_s2(model, loader, criterion, optimizer, device) -> float:
 @torch.no_grad()
 def evaluate_s2(model, loader, criterion, device, threshold: float = 0.5):
     """
-    Validation for Stage 2 (binary, BCEWithLogitsLoss).
-
-    model.eval() → MultiSampleDropoutHead returns mean of k logits (B, 1).
-    squeeze(-1) gives (B,) as expected by BCEWithLogitsLoss.
+    Validation for Stage 2 Engine A (binary, BCEWithLogitsLoss).
+    model.eval() → InceptionTime1D returns (B, 1) logit.
     """
     model.eval()
     running_loss = 0.0
@@ -447,7 +564,7 @@ def evaluate_s2(model, loader, criterion, device, threshold: float = 0.5):
     for signals, labels in loader:
         signals = signals.to(device, non_blocking=True)
         labels  = labels.to(device,  non_blocking=True).float()
-        logits  = model(signals).squeeze(-1)   # (B,) – averaged from k MSD outputs
+        logits  = model(signals).squeeze(-1)   # (B,)
         running_loss += criterion(logits, labels).item() * signals.size(0)
         preds = (torch.sigmoid(logits) >= threshold).long()
         all_preds.extend(preds.cpu().numpy())
@@ -475,12 +592,13 @@ def train_fold_s1(fold_idx: int, device: torch.device, cfg: dict,
     norm_params     : (mean, std)
     checkpoint_path : str
     best_val_report : str
+    best_val_preds  : (val_preds, val_labels)
     """
     fold_num = fold_idx + 1
 
     logger.log(f"\n[Phase A] --- Fold {fold_num}/{N_FOLDS} Stage1 Starting ---")
     logger.log_file("=" * 70)
-    logger.log_file(f"PHASE A | FOLD {fold_num} / {N_FOLDS}  – Stage 1 Generalist (5-class)")
+    logger.log_file(f"PHASE A | FOLD {fold_num} / {N_FOLDS}  – Stage 1 Generalist (5-class InceptionTime)")
     logger.log_file("=" * 70)
 
     train_ds, val_ds, norm_params, class_counts, n_cls = build_fold_datasets(
@@ -504,15 +622,16 @@ def train_fold_s1(fold_idx: int, device: torch.device, cfg: dict,
                               shuffle=False, num_workers=cfg["num_workers"],
                               pin_memory=cfg["pin_memory"])
 
-    model_s1 = CRNN1D(
-        in_channels             = cfg["in_channels"],
-        num_classes             = cfg["num_classes_s1"],
-        base_filters            = cfg["base_filters"],
-        gru_hidden              = cfg["gru_hidden_s1"],
-        use_multi_sample_dropout= False,
+    model_s1 = InceptionTime1D(
+        in_channels = cfg["in_channels"],
+        num_classes = cfg["num_classes_s1"],
+        nb_filters  = cfg["nb_filters"],
+        bottleneck  = cfg["bottleneck"],
+        depth       = cfg["depth"],
     ).to(device)
     n_params = sum(p.numel() for p in model_s1.parameters() if p.requires_grad)
-    logger.log_file(f"  Model_Stage1: CRNN1D (BiGRU hidden={cfg['gru_hidden_s1']})  |  Params: {n_params:,}")
+    logger.log_file(f"  Model_Stage1: InceptionTime1D (nb_filters={cfg['nb_filters']}, "
+                    f"depth={cfg['depth']})  |  Params: {n_params:,}")
 
     criterion_s1 = build_focal_loss(
         class_counts, cfg["num_classes_s1"], device,
@@ -592,26 +711,45 @@ def train_fold_s1(fold_idx: int, device: torch.device, cfg: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase B: Per-fold Stage 2 training
+# Phase B: Per-fold Stage 2 training (Dual-Engine: InceptionTime + GBDT)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _collect_raw_signals_from_loader(loader) -> np.ndarray:
+    """
+    Iterate a DataLoader and return the concatenated raw signal arrays.
+
+    DataLoader yields (signals_tensor, labels_tensor) where
+    signals_tensor is (B, 8, 300).  Returns np.ndarray (N, 8, 300).
+    """
+    all_signals = []
+    all_labels  = []
+    for signals, labels in loader:
+        all_signals.append(signals.numpy())
+        all_labels.append(labels.numpy())
+    return np.concatenate(all_signals, axis=0), np.concatenate(all_labels, axis=0)
+
 
 def train_fold_s2(fold_idx: int, device: torch.device, cfg: dict,
                   logger: DualLogger):
     """
-    Train one CV fold for Stage 2 (2-class specialist: L1 vs L2).
-    Model uses 1 output logit with BCEWithLogitsLoss + Multi-Sample Dropout.
+    Train one CV fold for Stage 2.
+
+    Engine A: InceptionTime1D (BCEWithLogitsLoss)
+    Engine B: LightGBM / XGBoost on handcrafted tabular features
 
     Returns
     -------
-    best_val_f1     : float
-    checkpoint_path : str
-    best_val_report : str
+    best_val_f1      : float  (Engine A best validation F1)
+    checkpoint_path  : str    (Engine A checkpoint)
+    gbdt_model       : fitted GBDT model for this fold
+    best_val_report  : str
     """
     fold_num = fold_idx + 1
 
     logger.log(f"\n[Phase B] --- Fold {fold_num}/{N_FOLDS} Stage2 Starting ---")
     logger.log_file("=" * 70)
-    logger.log_file(f"PHASE B | FOLD {fold_num} / {N_FOLDS}  – Stage 2 Specialist (L1 vs L2)")
+    logger.log_file(f"PHASE B | FOLD {fold_num} / {N_FOLDS}  – Stage 2 Specialist "
+                    f"(L1 vs L2 | InceptionTime + GBDT)")
     logger.log_file("=" * 70)
 
     train_ds, val_ds, _, class_counts, n_cls = build_fold_datasets(
@@ -631,7 +769,7 @@ def train_fold_s2(fold_idx: int, device: torch.device, cfg: dict,
     if len(train_ds) == 0 or len(val_ds) == 0:
         logger.log(f"  [S2|Fold {fold_num}] WARNING: No L1/L2 samples in this split – skipping.")
         ckpt_path = os.path.join(cfg["checkpoint_dir"], f"stage2_fold_{fold_num}_best.pth")
-        return 0.0, ckpt_path, ""
+        return 0.0, ckpt_path, None, ""
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
                               shuffle=True,  num_workers=cfg["num_workers"],
@@ -640,19 +778,17 @@ def train_fold_s2(fold_idx: int, device: torch.device, cfg: dict,
                               shuffle=False, num_workers=cfg["num_workers"],
                               pin_memory=cfg["pin_memory"])
 
-    # Stage 2 model: 1 output logit for BCEWithLogitsLoss + Multi-Sample Dropout
-    model_s2 = CRNN1D(
-        in_channels              = cfg["in_channels"],
-        num_classes              = 1,
-        base_filters             = cfg["base_filters"],
-        gru_hidden               = cfg["gru_hidden_s2"],
-        use_multi_sample_dropout = True,
-        ms_dropout_k             = 5,
-        ms_dropout_p             = 0.5,
+    # ── Engine A: InceptionTime1D ─────────────────────────────────────────────
+    model_s2 = InceptionTime1D(
+        in_channels = cfg["in_channels"],
+        num_classes = 1,
+        nb_filters  = cfg["nb_filters"],
+        bottleneck  = cfg["bottleneck"],
+        depth       = cfg["depth"],
     ).to(device)
     n_params = sum(p.numel() for p in model_s2.parameters() if p.requires_grad)
-    logger.log_file(f"  Model_Stage2: CRNN1D (BiGRU hidden={cfg['gru_hidden_s2']}, "
-                    f"MultiSampleDropout k=5 p=0.5)  |  Params: {n_params:,}")
+    logger.log_file(f"  Engine A: InceptionTime1D (nb_filters={cfg['nb_filters']}, "
+                    f"depth={cfg['depth']})  |  Params: {n_params:,}")
 
     criterion_s2 = build_bce_loss(class_counts, device)
     pos_w = float(class_counts[0]) / max(float(class_counts[1]), 1.0)
@@ -714,17 +850,60 @@ def train_fold_s2(fold_idx: int, device: torch.device, cfg: dict,
             break
 
     fold_summary = (
-        f"--- [S2] Fold {fold_num} done | "
+        f"--- [S2 Engine A] Fold {fold_num} done | "
         f"Best Val Macro F1: {early_stop.best_score:.6f} "
         f"(epoch {early_stop.best_epoch}) ---"
     )
     logger.log(fold_summary)
     logger.log_file("")
-    logger.log_file(f"  [S2] Classification Report @ Best Epoch ({early_stop.best_epoch}):")
+    logger.log_file(f"  [S2 Engine A] Classification Report @ Best Epoch ({early_stop.best_epoch}):")
     logger.log_file(best_val_report)
     logger.log_file("─" * 70)
 
-    return early_stop.best_score, ckpt_path, best_val_report
+    # ── Engine B: GBDT on tabular features ───────────────────────────────────
+    logger.log(f"\n  [S2 Engine B|Fold {fold_num}] Extracting tabular features for GBDT ...")
+
+    # Re-iterate loaders with shuffle=False to get ordered arrays
+    train_loader_ord = DataLoader(train_ds, batch_size=cfg["batch_size"] * 2,
+                                  shuffle=False, num_workers=cfg["num_workers"],
+                                  pin_memory=False)
+    val_loader_ord   = DataLoader(val_ds,   batch_size=cfg["batch_size"] * 2,
+                                  shuffle=False, num_workers=cfg["num_workers"],
+                                  pin_memory=False)
+
+    train_signals_np, train_labels_np = _collect_raw_signals_from_loader(train_loader_ord)
+    val_signals_np,   val_labels_np   = _collect_raw_signals_from_loader(val_loader_ord)
+
+    X_train_tab = extract_tabular_features(train_signals_np)   # (N_train, 23)
+    X_val_tab   = extract_tabular_features(val_signals_np)     # (N_val,   23)
+
+    sample_weight = None
+    if class_counts[1] > 0:
+        # Inverse-frequency sample weights to counter 13:1 imbalance
+        ratio = float(class_counts[0]) / float(class_counts[1])
+        sample_weight = np.where(train_labels_np == 1, ratio, 1.0).astype(np.float32)
+
+    gbdt_model, backend = build_gbdt_model()
+    logger.log(f"  [S2 Engine B|Fold {fold_num}] Training {backend} on "
+               f"{len(train_labels_np)} samples ({X_train_tab.shape[1]} features) ...")
+
+    t_gbdt = time.time()
+    if sample_weight is not None:
+        gbdt_model.fit(X_train_tab, train_labels_np, sample_weight=sample_weight)
+    else:
+        gbdt_model.fit(X_train_tab, train_labels_np)
+    gbdt_elapsed = time.time() - t_gbdt
+
+    gbdt_val_preds = gbdt_model.predict(X_val_tab)
+    gbdt_val_f1    = f1_score(val_labels_np, gbdt_val_preds, average="macro", zero_division=0)
+    gbdt_val_acc   = accuracy_score(val_labels_np, gbdt_val_preds) * 100.0
+    logger.log(f"  [S2 Engine B|Fold {fold_num}] {backend} Val Macro F1: {gbdt_val_f1:.4f}  "
+               f"Acc: {gbdt_val_acc:.2f}%  Time: {gbdt_elapsed:.1f}s")
+    logger.log_file(f"  [S2 Engine B|Fold {fold_num}] {backend} Val Macro F1: {gbdt_val_f1:.6f}  "
+                    f"Acc: {gbdt_val_acc:.4f}%  Time: {gbdt_elapsed:.2f}s")
+    logger.log_file("─" * 70)
+
+    return early_stop.best_score, ckpt_path, gbdt_model, best_val_report
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -747,355 +926,7 @@ def format_confusion_matrix(all_labels, all_preds, label_names=None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase C: Semi-Supervised Pseudo-Labeling Fine-Tuning
-# ══════════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad()
-def _collect_s1_ensemble_probs(s1_fold_results: list,
-                                test_loader,
-                                n_test: int,
-                                cfg: dict,
-                                device: torch.device) -> np.ndarray:
-    """
-    Accumulate F1-weighted TTA probabilities from all Stage 1 fold models.
-
-    Returns
-    -------
-    s1_ensemble_probs : np.ndarray, shape (N, num_classes_s1)
-    """
-    s1_weighted_prob_sum = np.zeros((n_test, cfg["num_classes_s1"]), dtype=np.float64)
-    s1_f1_total          = 0.0
-
-    for fold_idx, best_f1, norm_params, ckpt_path, _ in s1_fold_results:
-        model_s1 = CRNN1D(
-            in_channels              = cfg["in_channels"],
-            num_classes              = cfg["num_classes_s1"],
-            base_filters             = cfg["base_filters"],
-            gru_hidden               = cfg["gru_hidden_s1"],
-            use_multi_sample_dropout = False,
-        ).to(device)
-        model_s1.load_state_dict(torch.load(ckpt_path, map_location=device))
-        model_s1.eval()
-
-        fold_probs = []
-        for signals, _ in test_loader:
-            x      = signals.to(device, non_blocking=True)
-            p_orig = F.softmax(model_s1(x),        dim=1)
-            p_up   = F.softmax(model_s1(x * 1.05), dim=1)
-            p_down = F.softmax(model_s1(x * 0.95), dim=1)
-            fold_probs.append(((p_orig + p_up + p_down) / 3.0).cpu().numpy())
-
-        fold_probs_arr         = np.concatenate(fold_probs, axis=0)
-        s1_weighted_prob_sum  += best_f1 * fold_probs_arr
-        s1_f1_total           += best_f1
-
-    return s1_weighted_prob_sum / max(s1_f1_total, 1e-9)
-
-
-@torch.no_grad()
-def _collect_s2_ensemble_probs(s2_fold_results: list,
-                                routed_signals: torch.Tensor,
-                                cfg: dict,
-                                device: torch.device) -> np.ndarray:
-    """
-    Accumulate F1-weighted TTA sigmoid probabilities from all Stage 2 fold models
-    for the subset of test signals routed through Stage 1 "merged" prediction.
-
-    Returns
-    -------
-    s2_ensemble_probs : np.ndarray, shape (n_routed,)  probability of being L2
-    """
-    n_routed = routed_signals.size(0)
-    routed_ds     = TensorDataset(routed_signals)
-    routed_loader = DataLoader(routed_ds, batch_size=cfg["batch_size"] * 2,
-                               shuffle=False, num_workers=0)
-
-    s2_weighted_prob_sum = np.zeros(n_routed, dtype=np.float64)
-    s2_f1_total          = 0.0
-
-    for fold_idx, best_f1, ckpt_path, _ in s2_fold_results:
-        if best_f1 <= 0.0 or not os.path.isfile(ckpt_path):
-            continue
-        model_s2 = CRNN1D(
-            in_channels              = cfg["in_channels"],
-            num_classes              = 1,
-            base_filters             = cfg["base_filters"],
-            gru_hidden               = cfg["gru_hidden_s2"],
-            use_multi_sample_dropout = True,
-            ms_dropout_k             = 5,
-            ms_dropout_p             = 0.5,
-        ).to(device)
-        model_s2.load_state_dict(torch.load(ckpt_path, map_location=device))
-        model_s2.eval()
-
-        fold_probs_s2 = []
-        for (x_batch,) in routed_loader:
-            x      = x_batch.to(device, non_blocking=True)
-            p_orig = torch.sigmoid(model_s2(x).squeeze(-1))
-            p_up   = torch.sigmoid(model_s2(x * 1.05).squeeze(-1))
-            p_down = torch.sigmoid(model_s2(x * 0.95).squeeze(-1))
-            fold_probs_s2.append(((p_orig + p_up + p_down) / 3.0).cpu().numpy())
-
-        fold_probs_s2_arr     = np.concatenate(fold_probs_s2, axis=0)
-        s2_weighted_prob_sum += best_f1 * fold_probs_s2_arr
-        s2_f1_total          += best_f1
-
-    if s2_f1_total > 0.0:
-        return s2_weighted_prob_sum / s2_f1_total
-    return np.full(n_routed, 0.5, dtype=np.float64)
-
-
-def run_phase_c_pseudo_labeling(s1_fold_results: list,
-                                 s2_fold_results: list,
-                                 cfg:             dict,
-                                 device:          torch.device,
-                                 logger:          DualLogger,
-                                 folds_to_run:    list):
-    """
-    Phase C: Semi-supervised pseudo-label fine-tuning on high-confidence test samples.
-
-    Algorithm
-    ---------
-    1.  Build test DataLoader using Stage 1 fold-1 normalisation parameters.
-    2.  Collect 5-fold F1-weighted TTA ensemble probabilities over the test set
-        for Stage 1 (all N samples) and Stage 2 (routed "merged" samples).
-    3.  Slice high-confidence Stage 1 samples (max softmax > threshold).
-        Slice high-confidence Stage 2 samples (sigmoid > threshold or < 1−threshold).
-    4.  Augment the FULL training pool with the pseudo-labeled test instances.
-    5.  Fine-tune each fold checkpoint for cfg["pseudo_label_epochs"] epochs
-        at a reduced learning rate of cfg["pseudo_label_lr"] (= 3e-5).
-        Overwrites the existing checkpoints in-place.
-    """
-    logger.log("\n" + "═" * 70)
-    logger.log("  PHASE C – Semi-Supervised Pseudo-Labeling Fine-Tuning")
-    logger.log("═" * 70)
-
-    conf_thresh = cfg["pseudo_label_conf_thresh"]
-
-    # ── Step 1: Build test loader with fold-1 norm params ────────────────────
-    first_norm   = s1_fold_results[0][2]   # (mean, std) from Phase A fold 1
-    mean_norm, std_norm = first_norm
-    test_ds, _ = build_test_dataset(cfg["test_root"], mean_norm, std_norm)
-    test_loader = DataLoader(
-        test_ds,
-        batch_size  = cfg["batch_size"] * 2,
-        shuffle     = False,
-        num_workers = cfg["num_workers"],
-        pin_memory  = cfg["pin_memory"],
-    )
-    n_test = len(test_ds)
-    logger.log(f"  Test samples for pseudo-labeling: {n_test}")
-
-    # ── Step 2a: Collect all test signals tensor (for S2 routing) ────────────
-    all_test_signals = []
-    for signals, _ in test_loader:
-        all_test_signals.append(signals)
-    all_test_signals = torch.cat(all_test_signals, dim=0)   # (N, 8, 300)
-
-    # ── Step 2b: Stage 1 ensemble probabilities ───────────────────────────────
-    logger.log("  [Phase C] Computing Stage 1 ensemble probabilities ...")
-    s1_ensemble_probs = _collect_s1_ensemble_probs(
-        s1_fold_results, test_loader, n_test, cfg, device)   # (N, 5)
-    s1_max_probs  = s1_ensemble_probs.max(axis=1)             # (N,)
-    s1_preds      = s1_ensemble_probs.argmax(axis=1)          # (N,)
-
-    # High-confidence Stage 1 mask (all classes, including "merged" class 1)
-    s1_conf_mask  = s1_max_probs > conf_thresh
-    n_s1_pseudo   = int(s1_conf_mask.sum())
-    logger.log(f"  [Phase C] S1 high-conf (>{conf_thresh}): {n_s1_pseudo} / {n_test} "
-               f"samples")
-
-    # Class distribution of pseudo-labels
-    s1_label_names = ["L0", "L1_2_Merged", "L3", "L4", "L5"]
-    for ci in range(cfg["num_classes_s1"]):
-        cnt = int(((s1_preds == ci) & s1_conf_mask).sum())
-        logger.log(f"    {s1_label_names[ci]:>12}: {cnt}")
-
-    # ── Step 2c: Stage 2 ensemble probabilities for "merged" routed samples ──
-    s2_route_mask     = (s1_preds == 1)    # Stage 1 predicts "merged" class
-    n_routed          = int(s2_route_mask.sum())
-    s2_pseudo_mask    = np.zeros(n_test, dtype=bool)
-    s2_pseudo_labels  = np.full(n_test, -1, dtype=np.int64)
-
-    if n_routed > 0 and len(s2_fold_results) > 0:
-        logger.log(f"  [Phase C] Computing Stage 2 ensemble probs for {n_routed} routed samples ...")
-        routed_signals = all_test_signals[s2_route_mask]   # (n_routed, 8, 300)
-        s2_ensemble_probs = _collect_s2_ensemble_probs(
-            s2_fold_results, routed_signals, cfg, device)   # (n_routed,)
-
-        routed_indices = np.where(s2_route_mask)[0]
-        for i, idx in enumerate(routed_indices):
-            if s2_ensemble_probs[i] > conf_thresh:          # confident L2
-                s2_pseudo_labels[idx] = 1
-                s2_pseudo_mask[idx]   = True
-            elif s2_ensemble_probs[i] < (1.0 - conf_thresh):  # confident L1
-                s2_pseudo_labels[idx] = 0
-                s2_pseudo_mask[idx]   = True
-
-    n_s2_pseudo = int(s2_pseudo_mask.sum())
-    logger.log(f"  [Phase C] S2 high-conf: {n_s2_pseudo} samples  "
-               f"(L1: {int((s2_pseudo_labels == 0).sum())}  "
-               f"L2: {int((s2_pseudo_labels == 1).sum())})")
-
-    if n_s1_pseudo == 0 and n_s2_pseudo == 0:
-        logger.log("  [Phase C] No high-confidence samples found – skipping fine-tuning.")
-        return
-
-    # ── Step 3: Load FULL training pool & normalise with fold-1 params ───────
-    logger.log("  [Phase C] Loading full training pool ...")
-    all_train_signals, all_train_labels_orig, _, _ = load_all_samples(cfg["train_root"])
-    all_train_signals_norm = normalize(all_train_signals, mean_norm, std_norm)  # (N_train, 300, 8)
-
-    # Convert test signals from (N, 8, 300) → (N, 300, 8) for HARDataset
-    # HARDataset stores signals as (N, 300, 8) and transposes in __getitem__
-    test_signals_300_8 = all_test_signals.numpy().transpose(0, 2, 1)  # (N, 300, 8)
-
-    # ── Step 4a: Phase C fine-tune Stage 1 ───────────────────────────────────
-    if n_s1_pseudo > 0:
-        pseudo_test_sig_s1   = test_signals_300_8[s1_conf_mask]               # (n_s1, 300, 8)
-        pseudo_test_lbl_s1   = s1_preds[s1_conf_mask].astype(np.int64)        # stage-1 space
-        # Approximate original label for augmentation protection:
-        # Stage1 0→L0, 1→L1 approx, 2→L3, 3→L4, 4→L5  (pseudo-test data, not critical)
-        S1_TO_ORIG_APPROX    = {0: 0, 1: 1, 2: 3, 3: 4, 4: 5}
-        pseudo_test_orig_s1  = np.array([S1_TO_ORIG_APPROX[int(l)]
-                                          for l in pseudo_test_lbl_s1], dtype=np.int64)
-
-        # Combine: all training (stage1-remapped) + pseudo-labeled test
-        all_train_lbl_s1     = remap_labels_stage1(all_train_labels_orig)
-        comb_sig_s1          = np.concatenate([all_train_signals_norm, pseudo_test_sig_s1], axis=0)
-        comb_lbl_s1          = np.concatenate([all_train_lbl_s1,       pseudo_test_lbl_s1],  axis=0)
-        comb_orig_s1         = np.concatenate([all_train_labels_orig,   pseudo_test_orig_s1], axis=0)
-        comb_counts_s1       = np.bincount(comb_lbl_s1, minlength=cfg["num_classes_s1"])
-
-        logger.log(f"\n  [Phase C] Combined S1 pool: {len(comb_lbl_s1)} samples "
-                   f"(train={len(all_train_lbl_s1)}, pseudo={n_s1_pseudo})")
-        logger.log(f"  [Phase C] Class distribution: {comb_counts_s1.tolist()}")
-
-        for fold_idx, best_f1, norm_params, ckpt_path, _ in s1_fold_results:
-            if fold_idx not in folds_to_run:
-                continue
-            fold_num = fold_idx + 1
-            logger.log(f"\n  [Phase C|S1|Fold {fold_num}] Fine-tuning "
-                       f"{cfg['pseudo_label_epochs']} epochs  LR={cfg['pseudo_label_lr']:.1e}")
-
-            pseudo_ds_s1 = HARDataset(comb_sig_s1, comb_lbl_s1, comb_orig_s1, is_train=True)
-            pseudo_loader_s1 = DataLoader(
-                pseudo_ds_s1, batch_size=cfg["batch_size"],
-                shuffle=True, num_workers=cfg["num_workers"],
-                pin_memory=cfg["pin_memory"], drop_last=True)
-
-            model_s1_ft = CRNN1D(
-                in_channels              = cfg["in_channels"],
-                num_classes              = cfg["num_classes_s1"],
-                base_filters             = cfg["base_filters"],
-                gru_hidden               = cfg["gru_hidden_s1"],
-                use_multi_sample_dropout = False,
-            ).to(device)
-            model_s1_ft.load_state_dict(torch.load(ckpt_path, map_location=device))
-
-            crit_s1_ft = build_focal_loss(
-                comb_counts_s1, cfg["num_classes_s1"], device,
-                gamma=cfg["focal_gamma"], label_smoothing=cfg["label_smoothing"])
-            opt_s1_ft  = torch.optim.AdamW(
-                model_s1_ft.parameters(),
-                lr=cfg["pseudo_label_lr"],
-                weight_decay=cfg["weight_decay"])
-
-            for epoch in range(1, cfg["pseudo_label_epochs"] + 1):
-                t0 = time.time()
-                tr_loss = train_one_epoch_s1(
-                    model_s1_ft, pseudo_loader_s1, crit_s1_ft, opt_s1_ft, device,
-                    mixup_alpha=cfg["mixup_alpha"],
-                    label_smoothing=cfg["label_smoothing"],
-                    num_classes=cfg["num_classes_s1"],
-                )
-                elapsed = time.time() - t0
-                logger.log_console(
-                    f"  [PhC|S1|F{fold_num}] Ep {epoch:>2}/{cfg['pseudo_label_epochs']} | "
-                    f"Loss: {tr_loss:.4f} | Time: {elapsed:.1f}s")
-                logger.log_file(
-                    f"  [PhC|S1|F{fold_num}] Ep {epoch:>2}/{cfg['pseudo_label_epochs']} | "
-                    f"Loss: {tr_loss:.6f} | Time: {elapsed:.2f}s")
-
-            torch.save(model_s1_ft.state_dict(), ckpt_path)
-            logger.log(f"  [Phase C|S1|Fold {fold_num}] Checkpoint updated: {ckpt_path}")
-
-    # ── Step 4b: Phase C fine-tune Stage 2 ───────────────────────────────────
-    if n_s2_pseudo > 0 and len(s2_fold_results) > 0:
-        pseudo_test_sig_s2  = test_signals_300_8[s2_pseudo_mask]               # (n_s2, 300, 8)
-        pseudo_test_lbl_s2  = s2_pseudo_labels[s2_pseudo_mask].astype(np.int64)  # 0 or 1
-        pseudo_test_orig_s2 = np.where(pseudo_test_lbl_s2 == 0, 1, 2).astype(np.int64)
-
-        # All L1/L2 training samples (binary)
-        s2_mask            = (all_train_labels_orig == 1) | (all_train_labels_orig == 2)
-        all_s2_sig         = all_train_signals_norm[s2_mask]
-        all_s2_orig        = all_train_labels_orig[s2_mask]
-        all_s2_lbl         = np.array([STAGE2_MAP[int(l)] for l in all_s2_orig], dtype=np.int64)
-
-        comb_sig_s2        = np.concatenate([all_s2_sig,  pseudo_test_sig_s2],  axis=0)
-        comb_lbl_s2        = np.concatenate([all_s2_lbl,  pseudo_test_lbl_s2],  axis=0)
-        comb_orig_s2       = np.concatenate([all_s2_orig, pseudo_test_orig_s2], axis=0)
-        comb_counts_s2     = np.bincount(comb_lbl_s2, minlength=2)
-
-        logger.log(f"\n  [Phase C] Combined S2 pool: {len(comb_lbl_s2)} samples "
-                   f"(train={len(all_s2_lbl)}, pseudo={n_s2_pseudo})")
-        logger.log(f"  [Phase C] Binary distribution: L1={comb_counts_s2[0]}  L2={comb_counts_s2[1]}")
-
-        for fold_idx, best_f1, ckpt_path, _ in s2_fold_results:
-            if fold_idx not in folds_to_run:
-                continue
-            fold_num = fold_idx + 1
-            if best_f1 <= 0.0 or not os.path.isfile(ckpt_path):
-                logger.log(f"  [Phase C|S2|Fold {fold_num}] Checkpoint missing / F1=0 – skipping.")
-                continue
-            logger.log(f"\n  [Phase C|S2|Fold {fold_num}] Fine-tuning "
-                       f"{cfg['pseudo_label_epochs']} epochs  LR={cfg['pseudo_label_lr']:.1e}")
-
-            pseudo_ds_s2 = HARDataset(comb_sig_s2, comb_lbl_s2, comb_orig_s2, is_train=True)
-            pseudo_loader_s2 = DataLoader(
-                pseudo_ds_s2, batch_size=cfg["batch_size"],
-                shuffle=True, num_workers=cfg["num_workers"],
-                pin_memory=cfg["pin_memory"], drop_last=True)
-
-            model_s2_ft = CRNN1D(
-                in_channels              = cfg["in_channels"],
-                num_classes              = 1,
-                base_filters             = cfg["base_filters"],
-                gru_hidden               = cfg["gru_hidden_s2"],
-                use_multi_sample_dropout = True,
-                ms_dropout_k             = 5,
-                ms_dropout_p             = 0.5,
-            ).to(device)
-            model_s2_ft.load_state_dict(torch.load(ckpt_path, map_location=device))
-
-            crit_s2_ft = build_bce_loss(comb_counts_s2, device)
-            opt_s2_ft  = torch.optim.AdamW(
-                model_s2_ft.parameters(),
-                lr=cfg["pseudo_label_lr"],
-                weight_decay=cfg["weight_decay"])
-
-            for epoch in range(1, cfg["pseudo_label_epochs"] + 1):
-                t0 = time.time()
-                tr_loss = train_one_epoch_s2(
-                    model_s2_ft, pseudo_loader_s2, crit_s2_ft, opt_s2_ft, device)
-                elapsed = time.time() - t0
-                logger.log_console(
-                    f"  [PhC|S2|F{fold_num}] Ep {epoch:>2}/{cfg['pseudo_label_epochs']} | "
-                    f"Loss: {tr_loss:.4f} | Time: {elapsed:.1f}s")
-                logger.log_file(
-                    f"  [PhC|S2|F{fold_num}] Ep {epoch:>2}/{cfg['pseudo_label_epochs']} | "
-                    f"Loss: {tr_loss:.6f} | Time: {elapsed:.2f}s")
-
-            torch.save(model_s2_ft.state_dict(), ckpt_path)
-            logger.log(f"  [Phase C|S2|Fold {fold_num}] Checkpoint updated: {ckpt_path}")
-
-    logger.log("\n  [Phase C] Pseudo-labeling fine-tuning complete.")
-    logger.log(f"  Total high-confidence samples used: S1={n_s1_pseudo}  S2={n_s2_pseudo}")
-    logger.log("─" * 70)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Module 4: Hierarchical Softmax Averaging Ensemble Inference
+# Module 5: Hierarchical Dual-Engine Inference
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -1105,17 +936,25 @@ def hierarchical_inference(s1_fold_results: list,
                             device:          torch.device,
                             logger:          DualLogger) -> pd.DataFrame:
     """
-    Full hierarchical routing inference pipeline.
+    Full hierarchical routing inference pipeline (v9).
 
     Step 1: Stage 1 TTA ensemble (5 folds × 3 TTA scales, F1-weighted avg)
     Step 2: argmax → accept non-merged predictions, flag merged (idx==1)
-    Step 3: Stage 2 specialist TTA ensemble on flagged samples
-    Step 4: Recombine and write submission_v8_crnn.csv
+    Step 3: Stage 2 dual-engine on flagged samples:
+               Engine A: InceptionTime CNN sigmoid (F1-weighted TTA)
+               Engine B: GBDT probability on tabular features
+               P_final = (cnn_weight × P_CNN) + (gbdt_weight × P_GBDT)
+    Step 4: Recombine and write submission_v9_inception.csv
+
+    Test-Time Feature Normalization (Domain Adaptation):
+        Test data is normalised using the test set's OWN mean and std,
+        not the training distribution parameters. This corrects cross-subject
+        covariate shift in an unsupervised manner.
 
     Parameters
     ----------
     s1_fold_results : list of (fold_idx, best_f1, norm_params, ckpt_path, report)
-    s2_fold_results : list of (fold_idx, best_f1, ckpt_path, report)
+    s2_fold_results : list of (fold_idx, best_f1, ckpt_path, gbdt_model, report)
     cfg             : dict
     device          : torch.device
     logger          : DualLogger
@@ -1125,22 +964,53 @@ def hierarchical_inference(s1_fold_results: list,
     submission : pd.DataFrame  with columns ['Id', 'Label']
     """
     logger.log("\n" + "=" * 70)
-    logger.log("  HIERARCHICAL INFERENCE  (Stage1 → Route → Stage2)")
+    logger.log("  HIERARCHICAL INFERENCE  (Stage1 → Route → Stage2 Dual-Engine)")
     logger.log("=" * 70)
 
-    # ── Load test data using norm params from Stage 1 fold 1 ─────────────────
-    first_norm   = s1_fold_results[0][2]   # (mean, std)
-    test_ds, file_ids = build_test_dataset(
-        cfg["test_root"], first_norm[0], first_norm[1])
-    test_loader = DataLoader(
-        test_ds,
+    # ── Test-Time Feature Normalization ──────────────────────────────────────
+    # Load raw test signals (NOT normalised with training stats) using
+    # load_test_samples, which returns (N, 300, 8) without any normalisation.
+    # Then compute test-batch mean/std → intrinsic Z-score normalisation.
+    logger.log("\n  [TTFN] Loading test data with intrinsic Z-score normalisation ...")
+
+    # load_test_samples returns: signals (N, 300, 8), file_ids (N,)
+    raw_test_signals_300_8, file_ids = load_test_samples(cfg["test_root"])
+
+    # Transpose to (N, 8, 300) to match CNN input convention
+    raw_test_signals = raw_test_signals_300_8.transpose(0, 2, 1).astype(np.float32)  # (N, 8, 300)
+    n_test = raw_test_signals.shape[0]
+
+    # Compute per-channel mean and std across the test batch
+    # raw_test_signals: (N, 8, 300) → flatten per channel → (N*300,) per channel
+    test_flat = raw_test_signals.transpose(1, 0, 2).reshape(
+        raw_test_signals.shape[1], -1)   # (8, N*300)
+    test_mean = test_flat.mean(axis=1, keepdims=True)   # (8, 1)
+    test_std  = test_flat.std(axis=1,  keepdims=True)   # (8, 1)
+    test_std  = np.where(test_std < 1e-8, 1.0, test_std)
+
+    # Apply intrinsic standardisation: (N, 8, 300)
+    # normalise along channel dim: broadcast (8,1) → (8,300) → (N,8,300)
+    normed_test = (raw_test_signals - test_mean[np.newaxis, :, :]) / \
+                   test_std[np.newaxis, :, :]
+    normed_test = normed_test.astype(np.float32)
+
+    logger.log(f"  [TTFN] Test batch stats computed independently (N={n_test}). "
+               f"Per-channel mean: {test_mean.squeeze().tolist()}")
+    logger.log(f"  [TTFN] Per-channel std : {test_std.squeeze().tolist()}")
+
+    # Build a TensorDataset from the normalised test signals
+    normed_tensor = torch.from_numpy(normed_test)   # (N, 8, 300)
+    # Dummy label tensor (inference only)
+    dummy_labels  = torch.zeros(n_test, dtype=torch.long)
+    normed_test_ds     = TensorDataset(normed_tensor, dummy_labels)
+    normed_test_loader = DataLoader(
+        normed_test_ds,
         batch_size=cfg["batch_size"] * 2,
         shuffle=False,
         num_workers=cfg["num_workers"],
         pin_memory=cfg["pin_memory"],
     )
 
-    n_test = len(test_ds)
     logger.log(f"  Total test samples: {n_test}")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1155,18 +1025,18 @@ def hierarchical_inference(s1_fold_results: list,
         fold_num = fold_idx + 1
         logger.log(f"    S1 Fold {fold_num}: loading {ckpt_path}  (Val F1={best_f1:.6f})")
 
-        model_s1 = CRNN1D(
-            in_channels              = cfg["in_channels"],
-            num_classes              = cfg["num_classes_s1"],
-            base_filters             = cfg["base_filters"],
-            gru_hidden               = cfg["gru_hidden_s1"],
-            use_multi_sample_dropout = False,
+        model_s1 = InceptionTime1D(
+            in_channels = cfg["in_channels"],
+            num_classes = cfg["num_classes_s1"],
+            nb_filters  = cfg["nb_filters"],
+            bottleneck  = cfg["bottleneck"],
+            depth       = cfg["depth"],
         ).to(device)
         model_s1.load_state_dict(torch.load(ckpt_path, map_location=device))
         model_s1.eval()
 
         fold_probs = []
-        for signals, _ in test_loader:
+        for signals, _ in normed_test_loader:
             x = signals.to(device, non_blocking=True)
             # TTA: original / scale-up (+5%) / scale-down (−5%)
             p_orig = F.softmax(model_s1(x),        dim=1)
@@ -1200,7 +1070,7 @@ def hierarchical_inference(s1_fold_results: list,
     logger.log(f"  Samples routed to Stage 2     : {n_routed}")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2 + 3: Stage 2 Specialist for routed samples
+    # STEP 2 + 3: Stage 2 Dual-Engine Specialist for routed samples
     # ══════════════════════════════════════════════════════════════════════════
     # Final predictions array in ORIGINAL label space (0–5)
     final_preds = np.full(n_test, -1, dtype=np.int64)
@@ -1213,44 +1083,37 @@ def hierarchical_inference(s1_fold_results: list,
         final_preds[mask] = orig_lbl
 
     if n_routed > 0:
-        logger.log("\n  [Step 3] Stage 2 Specialist Ensemble for routed samples ...")
+        logger.log("\n  [Step 3] Stage 2 Dual-Engine for routed samples ...")
 
-        # Extract routed test signals (still normalised, on CPU via dataset)
-        # Re-load test signals tensor by iterating test_loader in order
-        all_test_signals = []
-        for signals, _ in test_loader:
-            all_test_signals.append(signals)
-        all_test_signals = torch.cat(all_test_signals, dim=0)   # (N, 8, 300)
-
-        routed_signals = all_test_signals[s2_route_mask]        # (n_routed, 8, 300)
-
-        # Build a simple tensor dataset for the routed samples
-        routed_ds     = TensorDataset(routed_signals)
-        routed_loader = DataLoader(
+        # Extract routed samples from the normalised test tensor
+        routed_signals_np = normed_test[s2_route_mask]          # (n_routed, 8, 300)
+        routed_tensor     = torch.from_numpy(routed_signals_np)  # (n_routed, 8, 300)
+        routed_ds         = TensorDataset(routed_tensor)
+        routed_loader     = DataLoader(
             routed_ds,
             batch_size=cfg["batch_size"] * 2,
             shuffle=False,
             num_workers=0,
         )
 
-        s2_weighted_prob_sum = np.zeros(n_routed, dtype=np.float64)
-        s2_f1_total          = 0.0
+        # ── Engine A: InceptionTime CNN ensemble ─────────────────────────────
+        logger.log("    [Engine A] InceptionTime CNN ensemble ...")
+        s2_cnn_weighted_sum = np.zeros(n_routed, dtype=np.float64)
+        s2_cnn_f1_total     = 0.0
 
-        for fold_idx, best_f1, ckpt_path, _ in s2_fold_results:
+        for fold_idx, best_f1, ckpt_path, gbdt_model, _ in s2_fold_results:
             fold_num = fold_idx + 1
             if best_f1 <= 0.0 or not os.path.isfile(ckpt_path):
-                logger.log(f"    S2 Fold {fold_num}: checkpoint missing / F1=0 – skipping.")
+                logger.log(f"      S2 Fold {fold_num}: checkpoint missing / F1=0 – skipping CNN.")
                 continue
-            logger.log(f"    S2 Fold {fold_num}: loading {ckpt_path}  (Val F1={best_f1:.6f})")
+            logger.log(f"      S2 Fold {fold_num}: loading {ckpt_path}  (Val F1={best_f1:.6f})")
 
-            model_s2 = CRNN1D(
-                in_channels              = cfg["in_channels"],
-                num_classes              = 1,
-                base_filters             = cfg["base_filters"],
-                gru_hidden               = cfg["gru_hidden_s2"],
-                use_multi_sample_dropout = True,
-                ms_dropout_k             = 5,
-                ms_dropout_p             = 0.5,
+            model_s2 = InceptionTime1D(
+                in_channels = cfg["in_channels"],
+                num_classes = 1,
+                nb_filters  = cfg["nb_filters"],
+                bottleneck  = cfg["bottleneck"],
+                depth       = cfg["depth"],
             ).to(device)
             model_s2.load_state_dict(torch.load(ckpt_path, map_location=device))
             model_s2.eval()
@@ -1265,21 +1128,53 @@ def hierarchical_inference(s1_fold_results: list,
                 p_tta  = (p_orig + p_up + p_down) / 3.0
                 fold_probs_s2.append(p_tta.cpu().numpy())
 
-            fold_probs_s2_arr     = np.concatenate(fold_probs_s2, axis=0)   # (n_routed,)
-            s2_weighted_prob_sum += best_f1 * fold_probs_s2_arr
-            s2_f1_total          += best_f1
-            logger.log(f"      → accumulated (weight={best_f1:.6f})")
+            fold_probs_s2_arr      = np.concatenate(fold_probs_s2, axis=0)   # (n_routed,)
+            s2_cnn_weighted_sum   += best_f1 * fold_probs_s2_arr
+            s2_cnn_f1_total       += best_f1
+            logger.log(f"        → accumulated (weight={best_f1:.6f})")
 
-        if s2_f1_total > 0.0:
-            s2_ensemble_probs = s2_weighted_prob_sum / s2_f1_total   # (n_routed,) prob of L2
-            # Apply decision threshold: >= threshold → L2 (orig 2), else → L1 (orig 1)
-            s2_preds_binary = (s2_ensemble_probs >= cfg["s2_threshold"]).astype(np.int64)
-            # Binary 0 → original L1, binary 1 → original L2
-            s2_preds_orig   = np.where(s2_preds_binary == 0, 1, 2)
+        if s2_cnn_f1_total > 0.0:
+            p_cnn = s2_cnn_weighted_sum / s2_cnn_f1_total   # (n_routed,) prob of L2
         else:
-            # Fallback: default all routed samples to L1
-            logger.log("  WARNING: No valid S2 folds – defaulting routed samples to L1.")
-            s2_preds_orig = np.ones(n_routed, dtype=np.int64)
+            logger.log("    WARNING: No valid S2 CNN folds – P_CNN defaults to 0.5.")
+            p_cnn = np.full(n_routed, 0.5, dtype=np.float64)
+
+        # ── Engine B: GBDT tabular ensemble ─────────────────────────────────
+        logger.log("    [Engine B] GBDT tabular feature ensemble ...")
+        X_routed_tab = extract_tabular_features(routed_signals_np)   # (n_routed, 23)
+
+        s2_gbdt_weighted_sum = np.zeros(n_routed, dtype=np.float64)
+        s2_gbdt_f1_total     = 0.0
+
+        for fold_idx, best_f1, ckpt_path, gbdt_model, _ in s2_fold_results:
+            fold_num = fold_idx + 1
+            if gbdt_model is None or best_f1 <= 0.0:
+                logger.log(f"      S2 Fold {fold_num}: GBDT model not available – skipping.")
+                continue
+            logger.log(f"      S2 GBDT Fold {fold_num}: predicting  (Val F1={best_f1:.6f})")
+
+            fold_gbdt_probs = gbdt_model.predict_proba(X_routed_tab)[:, 1]  # P(L2)
+            s2_gbdt_weighted_sum += best_f1 * fold_gbdt_probs
+            s2_gbdt_f1_total     += best_f1
+            logger.log(f"        → accumulated (weight={best_f1:.6f})")
+
+        if s2_gbdt_f1_total > 0.0:
+            p_gbdt = s2_gbdt_weighted_sum / s2_gbdt_f1_total   # (n_routed,) prob of L2
+        else:
+            logger.log("    WARNING: No valid S2 GBDT folds – P_GBDT defaults to 0.5.")
+            p_gbdt = np.full(n_routed, 0.5, dtype=np.float64)
+
+        # ── Weighted Decision Head ───────────────────────────────────────────
+        # P_specialist_final = cnn_weight × P_CNN + gbdt_weight × P_GBDT
+        cnn_w  = cfg["cnn_weight"]
+        gbdt_w = cfg["gbdt_weight"]
+        p_final = cnn_w * p_cnn + gbdt_w * p_gbdt
+
+        logger.log(f"\n    Ensemble weights: CNN={cnn_w:.2f}  GBDT={gbdt_w:.2f}")
+        logger.log(f"    Decision threshold: {cfg['s2_threshold']}")
+
+        s2_preds_binary = (p_final >= cfg["s2_threshold"]).astype(np.int64)
+        s2_preds_orig   = np.where(s2_preds_binary == 0, 1, 2)  # 0→L1, 1→L2
 
         # Write Stage 2 decisions into final_preds at the routed positions
         routed_indices = np.where(s2_route_mask)[0]
@@ -1328,7 +1223,7 @@ def hierarchical_inference(s1_fold_results: list,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HAR CRNN v8 – Hierarchical Two-Stage Training + Pseudo-Labeling")
+        description="HAR InceptionTime v9 – Hierarchical Two-Stage + GBDT Ensemble")
     parser.add_argument("--all-folds",  action="store_true",
                         help="Run all 5 folds (default: fold 1 only)")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
@@ -1337,8 +1232,6 @@ def main():
     parser.add_argument("--patience",   type=int,   default=CFG["patience"])
     parser.add_argument("--threshold",  type=float, default=CFG["s2_threshold"],
                         help="Stage 2 binary decision threshold (default=0.5)")
-    parser.add_argument("--skip-phase-c", action="store_true",
-                        help="Skip Phase C pseudo-labeling (debug / ablation)")
     args = parser.parse_args()
 
     CFG["run_all_folds"] = args.all_folds
@@ -1354,10 +1247,12 @@ def main():
     logger = DualLogger(CFG["log_path"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    gbdt_backend = "LightGBM" if LGBM_AVAILABLE else "XGBoost"
+
     # ── Header ────────────────────────────────────────────────────────────────
     header_lines = [
         "=" * 70,
-        "  HAR CRNN v8 – Hierarchical Two-Stage Classifier + Pseudo-Labeling",
+        "  HAR InceptionTime v9 – Heterogeneous Dual-Engine + TTFN",
         "=" * 70,
         f"  Log file      : {os.path.abspath(CFG['log_path'])}",
         f"  Device        : {device}",
@@ -1370,11 +1265,13 @@ def main():
     header_lines += [
         f"  Seed          : {CFG['seed']}  (deterministic=True, benchmark=False)",
         f"  In channels   : {CFG['in_channels']}  (8 stable: mean_x/y/z + std_x/y/z + mean_mag + std_mag)",
-        f"  Base filters  : {CFG['base_filters']}  (CNN: Stem=64, Block1=64, Block2=128)",
-        f"  BiGRU S1      : hidden={CFG['gru_hidden_s1']} (×2 bidirectional → repr=256)",
-        f"  BiGRU S2      : hidden={CFG['gru_hidden_s2']} (×2 bidirectional → repr=128)",
+        f"  nb_filters    : {CFG['nb_filters']}  (per branch → hidden_dim={CFG['nb_filters']*4})",
+        f"  Bottleneck    : {CFG['bottleneck']}",
+        f"  Depth         : {CFG['depth']}  (Inception blocks; residual every 3)",
         f"  S1 classes    : {CFG['num_classes_s1']}  (L0 | L1_2_Merged | L3 | L4 | L5)",
-        f"  S2 classes    : 1 logit / BCE + MultiSampleDropout(k=5, p=0.5)  (L1 vs L2)",
+        f"  S2 Engine A   : InceptionTime1D (1 logit / BCE)",
+        f"  S2 Engine B   : {gbdt_backend} (23 tabular features from std_mag + all-ch stats)",
+        f"  S2 Ensemble   : P_final = {CFG['cnn_weight']}×P_CNN + {CFG['gbdt_weight']}×P_GBDT",
         f"  Epochs        : {CFG['epochs']}",
         f"  Batch         : {CFG['batch_size']}",
         f"  LR            : {CFG['lr']}",
@@ -1385,10 +1282,8 @@ def main():
         f"  Patience      : {CFG['patience']}",
         f"  S2 Threshold  : {CFG['s2_threshold']}",
         f"  Folds         : {'all 5' if CFG['run_all_folds'] else 'fold 1 only'}",
-        f"  Ensemble      : F1-Weighted TTA (×1.00 / ×1.05 / ×0.95)",
-        f"  Phase C LR    : {CFG['pseudo_label_lr']}  (= 1/10 × baseline)",
-        f"  Phase C Epochs: {CFG['pseudo_label_epochs']}",
-        f"  Phase C Thresh: {CFG['pseudo_label_conf_thresh']}  (max softmax confidence)",
+        f"  S1 Ensemble   : F1-Weighted TTA (×1.00 / ×1.05 / ×0.95)",
+        f"  Domain Adapt  : Test-Time Feature Normalisation (intrinsic Z-score)",
         f"  Submission    : {CFG['submission_path']}",
         "=" * 70,
     ]
@@ -1401,7 +1296,7 @@ def main():
     # PHASE A – Train Stage 1 Generalist
     # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE A – Stage 1 Generalist Training (5-class CRNN)")
+    logger.log("  PHASE A – Stage 1 Generalist Training (5-class InceptionTime)")
     logger.log("═" * 70)
 
     t_phaseA_start  = time.time()
@@ -1437,21 +1332,20 @@ def main():
         logger.log(cm_text)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE B – Train Stage 2 Specialist
+    # PHASE B – Train Stage 2 Specialist (InceptionTime + GBDT)
     # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE B – Stage 2 Specialist Training (L1 vs L2 binary CRNN + MSD)")
+    logger.log("  PHASE B – Stage 2 Specialist Training "
+               "(L1 vs L2 | InceptionTime + GBDT Dual-Engine)")
     logger.log("═" * 70)
 
     t_phaseB_start  = time.time()
-    s2_fold_results = []   # (fold_idx, best_f1, ckpt_path, report)
-    s2_all_preds    = []
-    s2_all_labels   = []
+    s2_fold_results = []   # (fold_idx, best_f1, ckpt_path, gbdt_model, report)
 
     for fold_idx in folds_to_run:
-        best_f1, ckpt_path, report = train_fold_s2(
+        best_f1, ckpt_path, gbdt_model, report = train_fold_s2(
             fold_idx, device, CFG, logger)
-        s2_fold_results.append((fold_idx, best_f1, ckpt_path, report))
+        s2_fold_results.append((fold_idx, best_f1, ckpt_path, gbdt_model, report))
 
     t_phaseB = time.time() - t_phaseB_start
 
@@ -1459,7 +1353,7 @@ def main():
     logger.log("  PHASE B SUMMARY – Stage 2 Cross-Validation")
     logger.log("═" * 70)
     s2_f1_scores = [r[1] for r in s2_fold_results]
-    for fi, bf1, _, _ in s2_fold_results:
+    for fi, bf1, _, _, _ in s2_fold_results:
         logger.log(f"  [S2] Fold {fi+1}:  Best Val Macro F1 = {bf1:.6f}")
     if len(s2_f1_scores) > 0:
         logger.log(f"\n  [S2] Mean F1 = {np.mean(s2_f1_scores):.6f}  ±  {np.std(s2_f1_scores):.6f}")
@@ -1467,26 +1361,7 @@ def main():
     logger.log(f"  Total A+B wall-clock: {(t_phaseA + t_phaseB) / 60:.1f} min")
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE C – Semi-Supervised Pseudo-Labeling Fine-Tuning
-    # ════════════════════════════════════════════════════════════════════════
-    if not args.skip_phase_c and len(s1_fold_results) > 0:
-        t_phaseC_start = time.time()
-        run_phase_c_pseudo_labeling(
-            s1_fold_results = s1_fold_results,
-            s2_fold_results = s2_fold_results,
-            cfg             = CFG,
-            device          = device,
-            logger          = logger,
-            folds_to_run    = folds_to_run,
-        )
-        t_phaseC = time.time() - t_phaseC_start
-        logger.log(f"  Phase C wall-clock: {t_phaseC / 60:.1f} min")
-        logger.log(f"  Total A+B+C wall-clock: {(t_phaseA + t_phaseB + t_phaseC) / 60:.1f} min")
-    else:
-        logger.log("\n  [Phase C] Skipped (--skip-phase-c flag or no S1 fold results).")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # INFERENCE – Hierarchical Routing
+    # INFERENCE – Hierarchical Routing with TTFN + Dual-Engine
     # ════════════════════════════════════════════════════════════════════════
     if len(s1_fold_results) > 0:
         submission = hierarchical_inference(
@@ -1498,7 +1373,7 @@ def main():
         )
 
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v8 (CRNN + BiGRU + Pseudo-Labeling) complete.")
+    logger.log("  Pipeline v9 (InceptionTime + GBDT Dual-Engine + TTFN) complete.")
     logger.log(f"  Hierarchical submission: {CFG['submission_path']}")
     logger.log("=" * 70)
 
