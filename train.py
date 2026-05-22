@@ -1,7 +1,7 @@
 """
 train.py
 --------
-HAR Flat 6-Class OOF Stacking & LightGBM Meta-Learner Pipeline (v11).
+HAR Flat 6-Class OOF Stacking & LightGBM Meta-Learner Pipeline (v12).
 
 Architecture
 ────────────
@@ -19,25 +19,36 @@ Training Phases
     • Batch-level Mixup (Beta(α=0.2))
     • AdamW + CosineAnnealingLR
     • Early stop on validation Macro F1 (patience=25)
-    • Saves: checkpoints/v11_fold_{n}_best.pth
+    • Saves: checkpoints/v12_fold_{n}_best.pth
     • OOF Collection:
         – At best epoch of each fold, stores val Softmax probs → (N_train, 6) OOF matrix
         – For test set, runs all 5 fold weights × TTA(0.95, 1.00, 1.05) → (N_test, 6) mean
 
-  Phase B – Post-Normalisation Feature Engineering:
-    • Extract 136 handcrafted time-frequency features per signal window
+  Phase B – Post-Normalisation Feature Engineering (v12 Surgery):
+    • Extract 136 handcrafted temporal features per signal window (FFT PRUNED)
     • ALWAYS applied AFTER global Z-score normalisation (no data leakage)
     • Features: 17 per channel × 8 channels = 136
+    • v12 changes: FFT features REMOVED; Jerk statistics + Rolling Variation CV INJECTED
 
-  Phase C – LightGBM Stacked Meta-Learner:
+  Phase C – LightGBM Stacked Meta-Learner (v12 Upgrade):
     • Concatenate CNN OOF probs (N, 6) + tabular features (N, 136) → (N, 142)
     • Train 5-fold 6-class LightGBM classifier over the 142-dimensional meta-space
-    • Clean argmax over meta-learner output → submission_v11_stacking.csv
+    • Custom Multi-Class Focal Loss (γ=2.0) replaces default multiclass objective
+    • colsample_bytree=0.6 feature fraction defence prevents CNN prob saturation
+    • Clean argmax over meta-learner output → submission_v12_stacking.csv
 
-    REMOVED from v10 (v11 decommissions):
+    REMOVED from v11 (v12 decommissions):
       ✗ Test-Time Feature Normalization (TTFN) – completely removed
       ✗ Manual probability blending (0.5×CNN + 0.5×GBDT)
       ✗ OOF blending weight optimization (scipy L-BFGS-B)
+      ✗ Default objective='multiclass' + class_weight='balanced' (replaced by focal loss)
+      ✗ FFT frequency-domain features (fft_dc, fft_max_amp, fft_energy) per channel
+
+    ADDED in v12:
+      ✓ Custom LightGBM Multi-Class Focal Loss objective (γ=2.0)
+      ✓ Jerk statistics: mean & std of d²X/dt² (2nd temporal derivative)
+      ✓ Rolling variance Coefficient of Variation (CV = std/mean over 50-step windows)
+      ✓ Feature fraction defense: colsample_bytree=0.6
 
 Usage
 ─────
@@ -114,7 +125,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v11_stacking.csv",
+    "submission_path"   : "./submission_v12_stacking.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -151,7 +162,7 @@ CFG = {
     "mixup_alpha"       : 0.2,
 
     # Cross-validation ────────────────────────────────────────────────────────
-    "run_all_folds"     : False,
+    "run_all_folds"     : True,    # v12 default: always run all 5 folds
 
     # Reproducibility ─────────────────────────────────────────────────────────
     "seed"              : 42,
@@ -309,7 +320,7 @@ class EarlyStopping:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 4: Comprehensive Time-Frequency Feature Extractor (136 features)
+# Module 4: Temporal Feature Extractor v12 (136 features, FFT pruned)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _zero_crossing_rate(signal_1d: np.ndarray) -> float:
@@ -323,26 +334,52 @@ def _zero_crossing_rate(signal_1d: np.ndarray) -> float:
     return float(crossings) / max(len(signal_1d) - 1, 1)
 
 
+def _rolling_variance_cv(signal_1d: np.ndarray, window: int = 50) -> float:
+    """
+    Rolling Variance Coefficient of Variation (CV = std / |mean|).
+
+    Slides a window of `window` steps across the signal (stride=1), computes
+    the variance at each position, then returns CV = std(vars) / |mean(vars)|.
+    Distinguishes irregular L2 stair-climbing (high CV) from uniform L1/L4
+    running cadences (low CV).  Returns 0.0 when mean ≈ 0.
+    """
+    n = len(signal_1d)
+    n_windows = max(n - window + 1, 1)
+    rolling_vars = np.array(
+        [float(np.var(signal_1d[s:s + window])) for s in range(n_windows)],
+        dtype=np.float64,
+    )
+    rv_mean = float(np.mean(rolling_vars))
+    rv_std  = float(np.std(rolling_vars))
+    if abs(rv_mean) < 1e-12:
+        return 0.0
+    return rv_std / abs(rv_mean)
+
+
 def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
     """
-    Extract 136 handcrafted time-frequency features from (N, 8, 300) signal windows.
+    Extract 136 handcrafted temporal features from (N, 8, 300) signal windows.
 
     IMPORTANT: This function MUST be called on NORMALISED signals (post global Z-score).
 
-    Feature layout per channel (17 features × 8 channels = 136 total):
-    ─────────────────────────────────────────────────────────────────────
+    v12 Feature layout per channel (17 features × 8 channels = 136 total):
+    ─────────────────────────────────────────────────────────────────────────
     Time-Domain Statistics (10 features):
-        mean, std, median, max, min, variance, skewness, kurtosis,
-        25th percentile (Q1), 75th percentile (Q3)
+        mean, std, median, max, min, variance, skewness, kurtosis, Q1, Q3
 
-    Time-Domain Dynamics from first derivative X' = X[t] - X[t-1] (4 features):
-        derivative_mean, derivative_std,
-        derivative_zero_crossing_rate, derivative_energy
+    Time-Domain Dynamics – 1st derivative (4 features):
+        deriv_mean, deriv_std, deriv_zcr, deriv_energy
 
-    Frequency-Domain (FFT) Spectra (3 features):
-        fft_dc_component   (magnitude of 0Hz / DC term)
-        fft_max_amplitude  (maximum spectral amplitude across all bins)
-        fft_spectral_energy (sum of squared magnitudes of all FFT coefficients)
+    Jerk Statistics – 2nd derivative d²X/dt² (2 features):
+        jerk_mean  – mean of |d²X/dt²|, maps sudden structural impacts
+        jerk_std   – std of d²X/dt²,   quantifies jolt irregularity
+
+    Rolling Variation Complexity (1 feature):
+        rolling_var_cv – CV of 50-step rolling variance (std/|mean|);
+                         high for irregular L2 stair motion, low for periodic L1/L4
+
+    v12 PRUNED (vs v11):
+        ✗ fft_dc_component, fft_max_amplitude, fft_spectral_energy  – all removed
 
     Total: 17 × 8 = 136 features per sample.
 
@@ -366,37 +403,40 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
             sig = sample[ch].astype(np.float64)   # (300,)
 
             # ── Time-Domain Statistics (10 features) ──────────────────────────
-            feat_mean     = float(np.mean(sig))
-            feat_std      = float(np.std(sig))
-            feat_median   = float(np.median(sig))
-            feat_max      = float(np.max(sig))
-            feat_min      = float(np.min(sig))
-            feat_var      = float(np.var(sig))
-            feat_skew     = float(scipy_skew(sig, bias=True))
-            feat_kurt     = float(scipy_kurtosis(sig, fisher=True, bias=True))
-            feat_q25      = float(np.percentile(sig, 25))
-            feat_q75      = float(np.percentile(sig, 75))
+            feat_mean   = float(np.mean(sig))
+            feat_std    = float(np.std(sig))
+            feat_median = float(np.median(sig))
+            feat_max    = float(np.max(sig))
+            feat_min    = float(np.min(sig))
+            feat_var    = float(np.var(sig))
+            feat_skew   = float(scipy_skew(sig, bias=True))
+            feat_kurt   = float(scipy_kurtosis(sig, fisher=True, bias=True))
+            feat_q25    = float(np.percentile(sig, 25))
+            feat_q75    = float(np.percentile(sig, 75))
 
-            # ── Time-Domain Dynamics: 1st derivative (4 features) ─────────────
-            deriv = np.diff(sig)                              # (299,)
+            # ── 1st derivative dynamics (4 features) ──────────────────────────
+            deriv        = np.diff(sig)                    # (299,)
             deriv_mean   = float(np.mean(deriv))
             deriv_std    = float(np.std(deriv))
             deriv_zcr    = _zero_crossing_rate(deriv)
             deriv_energy = float(np.sum(deriv ** 2))
 
-            # ── Frequency-Domain: FFT (3 features) ────────────────────────────
-            fft_coeffs  = np.fft.rfft(sig)                   # (151,) complex
-            fft_mag     = np.abs(fft_coeffs)                  # magnitude spectrum
-            fft_dc      = float(fft_mag[0])                   # DC component (0 Hz)
-            fft_max_amp = float(np.max(fft_mag))              # max spectral amplitude
-            fft_energy  = float(np.sum(fft_mag ** 2))         # total spectral energy
+            # ── Jerk: 2nd derivative d²X/dt² (2 features) ─────────────────────
+            jerk      = np.diff(deriv)                     # (298,)
+            jerk_mean = float(np.mean(np.abs(jerk)))       # mean absolute jerk
+            jerk_std  = float(np.std(jerk))                # std of signed jerk
+
+            # ── Rolling Variation CV (1 feature) ──────────────────────────────
+            rolling_var_cv = _rolling_variance_cv(sig, window=50)
 
             # Collect all 17 features for this channel
+            # (10 time-domain + 4 deriv + 2 jerk + 1 rolling_var_cv = 17)
             ch_feats = [
                 feat_mean, feat_std, feat_median, feat_max, feat_min,
                 feat_var, feat_skew, feat_kurt, feat_q25, feat_q75,
                 deriv_mean, deriv_std, deriv_zcr, deriv_energy,
-                fft_dc, fft_max_amp, fft_energy,
+                jerk_mean, jerk_std,
+                rolling_var_cv,
             ]
             row_feats.extend(ch_feats)
 
@@ -405,18 +445,121 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
     return np.stack(feature_rows, axis=0)   # (N, 136)
 
 
-N_TAB_FEATURES = 136   # 17 features × 8 channels
+N_TAB_FEATURES = 136   # 17 features × 8 ch  (v12: 10 stat + 4 deriv + 2 jerk + 1 rv_cv)
 N_META_FEATURES = N_TAB_FEATURES + NUM_CLASSES   # 136 + 6 = 142
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 5: LightGBM Meta-Learner (6-class, 142-dim stacked input)
+# Module 5: LightGBM Meta-Learner v12 (Custom Focal Loss + Feature Fraction)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Custom Multi-Class Focal Loss for LightGBM ────────────────────────────────
+# LightGBM custom objective receives raw leaf scores (logits) and must return
+# (gradient, hessian) arrays of shape (N * num_class,) in row-major order
+# [sample_0_class_0, sample_0_class_1, ..., sample_N_class_K].
+#
+# Focal Loss reduction for class k at sample i:
+#   p_k   = softmax(z)_k
+#   FL_k  = -(1 - p_true)^γ * log(p_true)      [for the true class]
+#
+# Compact gradient derivation (Lin et al. 2017 adapted to multi-class softmax):
+#   ∂FL/∂z_k = focal_w * (p_k - 1_{y=k})
+#             + γ * focal_w * log(p_true) * (p_k - 1_{y=k})  [correction term]
+# where focal_w = (1 - p_true)^γ
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LGBM_FOCAL_GAMMA: float = 2.0   # γ – focusing parameter
+
+
+def _focal_multiclass_objective(
+        y_true: np.ndarray,
+        y_pred: np.ndarray) -> tuple:
+    """
+    Custom multi-class Focal Loss objective for LightGBM (sklearn API).
+
+    LightGBM's sklearn wrapper calls the custom objective as:
+        grad, hess = func(y_true, y_pred)
+    where y_true is a numpy array of integer labels (NOT a lgb.Dataset).
+
+    Parameters
+    ----------
+    y_true : np.ndarray, shape (N,)       – integer class labels 0..K-1
+    y_pred : np.ndarray, shape (N * K,)   – raw leaf scores, row-major order
+
+    Returns
+    -------
+    grad : np.ndarray, shape (N * K,)
+    hess : np.ndarray, shape (N * K,)
+    """
+    gamma  = _LGBM_FOCAL_GAMMA
+    y_true = y_true.astype(np.int32)
+    N      = len(y_true)
+    K      = NUM_CLASSES
+
+    # Reshape to (N, K) and compute numerically stable softmax
+    scores = y_pred.reshape(N, K)
+    scores = scores - scores.max(axis=1, keepdims=True)
+    exp_s  = np.exp(scores)
+    prob   = exp_s / exp_s.sum(axis=1, keepdims=True)          # (N, K)
+
+    # One-hot encoding of ground-truth labels
+    one_hot = np.zeros((N, K), dtype=np.float64)
+    one_hot[np.arange(N), y_true] = 1.0
+
+    # True-class probability and focal weight per sample
+    p_true  = prob[np.arange(N), y_true]                       # (N,)
+    focal_w = (1.0 - p_true) ** gamma                          # (N,)
+    log_pt  = np.log(p_true + 1e-9)                            # (N,)
+
+    # ── Gradient: focal-weighted CE gradient + γ-correction term ──────────────
+    # Shape (N, K): for each class k, residual = (p_k - 1_{y=k})
+    residual = prob - one_hot                                   # (N, K)
+    grad = (
+        focal_w[:, None] * residual
+        + gamma * focal_w[:, None] * log_pt[:, None] * residual
+    )
+
+    # ── Hessian: diagonal approximation, re-weighted CE hessian ─────────────
+    hess = np.maximum(focal_w[:, None] * prob * (1.0 - prob), 1e-6)
+
+    return grad.flatten().astype(np.float64), hess.flatten().astype(np.float64)
+
+
+def _focal_multiclass_eval(
+        y_true: np.ndarray,
+        y_pred: np.ndarray) -> tuple:
+    """
+    Custom Focal Loss evaluation metric (sklearn API).
+    Returns ('focal_loss', value, is_higher_better=False).
+    """
+    gamma  = _LGBM_FOCAL_GAMMA
+    y_true = y_true.astype(np.int32)
+    N      = len(y_true)
+    K      = NUM_CLASSES
+
+    scores = y_pred.reshape(N, K)
+    scores = scores - scores.max(axis=1, keepdims=True)
+    exp_s  = np.exp(scores)
+    prob   = exp_s / exp_s.sum(axis=1, keepdims=True)
+
+    p_true  = prob[np.arange(N), y_true]
+    focal_w = (1.0 - p_true) ** gamma
+    loss    = float(np.mean(-focal_w * np.log(p_true + 1e-9)))
+    return "focal_loss", loss, False
+
+
 def build_meta_lgbm_model() -> lgb.LGBMClassifier:
-    """Instantiate a 6-class LightGBM meta-learner for the stacking layer."""
+    """
+    Instantiate a 6-class LightGBM meta-learner for the stacking layer (v12).
+
+    v12 upgrades vs v11:
+    ──────────────────────────────────────────────────────────────────
+    • objective     : custom focal loss (γ=2.0)  ← replaces 'multiclass'
+    • class_weight  : REMOVED (focal loss handles imbalance natively)
+    • colsample_bytree : 0.6  ← feature fraction defense (was 0.8)
+    """
     return lgb.LGBMClassifier(
-        objective        = "multiclass",
+        objective        = _focal_multiclass_objective,
         num_class        = NUM_CLASSES,
         n_estimators     = 1000,
         learning_rate    = 0.05,
@@ -425,10 +568,10 @@ def build_meta_lgbm_model() -> lgb.LGBMClassifier:
         min_child_samples= 20,
         subsample        = 0.8,
         subsample_freq   = 1,
-        colsample_bytree = 0.8,
+        colsample_bytree = 0.6,   # v12: feature fraction defense (was 0.8)
         reg_alpha        = 0.1,
         reg_lambda       = 1.0,
-        class_weight     = "balanced",
+        # class_weight removed – focal loss targets imbalance directly
         random_state     = 42,
         verbose          = -1,
         n_jobs           = -1,
@@ -619,7 +762,7 @@ def train_fold_dl(fold_idx:    int,
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
     ckpt_path  = os.path.join(cfg["checkpoint_dir"],
-                              f"v11_fold_{fold_num}_best.pth")
+                              f"v12_fold_{fold_num}_best.pth")
     early_stop = EarlyStopping(patience=cfg["patience"], checkpoint_path=ckpt_path)
 
     best_val_preds  = (None, None)
@@ -862,7 +1005,7 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
                        for stat in ["mean","std","median","max","min","var",
                                     "skew","kurt","q25","q75",
                                     "deriv_mean","deriv_std","deriv_zcr","deriv_energy",
-                                    "fft_dc","fft_max_amp","fft_energy"]]
+                                    "jerk_mean","jerk_std","rolling_var_cv"]]
         fi_pairs = sorted(zip(feat_names, fi), key=lambda x: x[1], reverse=True)
         top20_str = "\n".join(
             f"    {rank+1:>2}. {nm:<38s} {imp:>8d}"
@@ -905,7 +1048,7 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
                         for stat in ["mean","std","median","max","min","var",
                                      "skew","kurt","q25","q75",
                                      "deriv_mean","deriv_std","deriv_zcr","deriv_energy",
-                                     "fft_dc","fft_max_amp","fft_energy"]]
+                                     "jerk_mean","jerk_std","rolling_var_cv"]]
     fi_sum = np.zeros(N_META_FEATURES, dtype=np.float64)
     for mm in meta_models:
         fi_sum += mm.feature_importances_.astype(np.float64)
@@ -926,16 +1069,16 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HAR SE-InceptionTime v11 – OOF Stacking + LightGBM Meta-Learner")
-    parser.add_argument("--all-folds",  action="store_true",
-                        help="Run all 5 folds (default: fold 1 only)")
+        description="HAR SE-InceptionTime v12 – OOF Stacking + LightGBM Focal Loss Meta-Learner")
+    parser.add_argument("--fold-1-only", action="store_true",
+                        help="Run fold 1 only (default: all 5 folds)")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
     parser.add_argument("--lr",         type=float, default=CFG["lr"])
     parser.add_argument("--patience",   type=int,   default=CFG["patience"])
     args = parser.parse_args()
 
-    CFG["run_all_folds"] = args.all_folds
+    CFG["run_all_folds"] = not args.fold_1_only   # default True; --fold-1-only overrides
     CFG["epochs"]        = args.epochs
     CFG["batch_size"]    = args.batch_size
     CFG["lr"]            = args.lr
@@ -951,8 +1094,8 @@ def main():
     hidden_dim = CFG["nb_filters"] * 4
     header_lines = [
         "=" * 70,
-        "  HAR SE-InceptionTime v11 – OOF Stacking + LightGBM Meta-Learner",
-        "  (TTFN REMOVED | Global Z-score Norm | 142-dim Meta-Space)",
+        "  HAR SE-InceptionTime v12 – OOF Stacking + LightGBM Focal Loss Meta-Learner",
+        "  (TTFN REMOVED | Global Z-score Norm | 142-dim | FFT pruned | LGB Focal γ=2.0)",
         "=" * 70,
         f"  Log file      : {os.path.abspath(CFG['log_path'])}",
         f"  Device        : {device}",
@@ -977,8 +1120,8 @@ def main():
         f"  Normalisation : GLOBAL training-set Z-score (NO per-test TTFN)",
         f"  Meta Features : {NUM_CLASSES} CNN OOF probs + {N_TAB_FEATURES} tabular "
         f"= {N_META_FEATURES} dims",
-        f"  Meta-Learner  : LightGBM 5-fold CV (n_estimators=1000)",
-        f"  Tabular feat  : 17 per channel × 8 channels (extracted post-normalisation)",
+        f"  Meta-Learner  : LightGBM 5-fold CV (n_estimators=1000, custom focal γ={_LGBM_FOCAL_GAMMA}, colsample=0.6)",
+        f"  Tabular feat  : 17 per ch × 8 (10stat+4deriv+2jerk+1rv_cv, FFT pruned)",
         f"  CNN TTA       : ×0.95 / ×1.00 / ×1.05 arithmetic mean",
         f"  Blend logic   : NONE (meta-learner argmax only, no manual weighting)",
         f"  Epochs        : {CFG['epochs']}",
@@ -1223,7 +1366,7 @@ def main():
 
     total_time = t_phaseA + t_phaseB + t_phaseC
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v11 (SE-InceptionTime OOF Stacking + LightGBM Meta-Learner) complete.")
+    logger.log("  Pipeline v12 (SE-InceptionTime OOF Stacking + LightGBM Focal Loss) complete.")
     logger.log(f"  Phase A (CNN Training):          {t_phaseA / 60:.1f} min")
     logger.log(f"  Phase B (Feature Extraction):    {t_phaseB:.1f}s")
     logger.log(f"  Phase C (Meta-Learner Training): {t_phaseC / 60:.1f} min")
