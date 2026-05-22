@@ -1,51 +1,49 @@
 """
 train.py
 --------
-Flat 6-Class SE-InceptionTime + LightGBM Heterogeneous Ensemble Pipeline (v10).
+HAR Flat 6-Class OOF Stacking & LightGBM Meta-Learner Pipeline (v11).
 
 Architecture
 ────────────
   Global Flat 6-Class Task  : L0, L1, L2, L3, L4, L5
-  Engine A (DL)  : SE-InceptionTime1D – 6-class flat classifier
-  Engine B (GBDT): LightGBM on 100+ handcrafted time-frequency tabular features
+  Base Model  (DL)          : SE-InceptionTime1D – 6-class flat classifier
+  Meta-Learner (GBDT)       : LightGBM on 142-dimensional stacked meta-features
+                               = 6 CNN OOF probabilities + 136 handcrafted tabular features
 
 Training Phases
 ───────────────
-  Phase A – SE-InceptionTime (Engine A):
+  Phase A – SE-InceptionTime Base Model (OOF Feature Extraction):
     • 5-fold StratifiedGroupKFold on flat 6-class labels
+    • Global Z-score normalisation computed from the ENTIRE training set (not per-fold)
     • Focal Loss (γ=2.0, ε=0.1 label smoothing, α=inverse-frequency)
     • Batch-level Mixup (Beta(α=0.2))
     • AdamW + CosineAnnealingLR
     • Early stop on validation Macro F1 (patience=25)
-    • Saves: checkpoints/v10_fold_{n}_best.pth
-    • Accumulates full (N, 6) OOF probability matrices
+    • Saves: checkpoints/v11_fold_{n}_best.pth
+    • OOF Collection:
+        – At best epoch of each fold, stores val Softmax probs → (N_train, 6) OOF matrix
+        – For test set, runs all 5 fold weights × TTA(0.95, 1.00, 1.05) → (N_test, 6) mean
 
-  Phase B – LightGBM (Engine B):
-    • Same 5-fold splits as Phase A
-    • 100+ time-frequency features per 8-channel signal window
-    • Global 6-class LightGBM classifier per fold
-    • Accumulates full (N, 6) OOF probability matrices
+  Phase B – Post-Normalisation Feature Engineering:
+    • Extract 136 handcrafted time-frequency features per signal window
+    • ALWAYS applied AFTER global Z-score normalisation (no data leakage)
+    • Features: 17 per channel × 8 channels = 136
 
-OOF Blending Vector Optimization
-─────────────────────────────────
-  • Collects full OOF matrices from both engines across all folds
-  • scipy.optimize.minimize searches for W=[w0..w5] ∈ [0,1]^6
-  • P_blend[c] = w_c × P_CNN[c] + (1-w_c) × P_GBDT[c]
-  • Objective: maximize global validation Macro F1
+  Phase C – LightGBM Stacked Meta-Learner:
+    • Concatenate CNN OOF probs (N, 6) + tabular features (N, 136) → (N, 142)
+    • Train 5-fold 6-class LightGBM classifier over the 142-dimensional meta-space
+    • Clean argmax over meta-learner output → submission_v11_stacking.csv
 
-Inference
-─────────
-  1. Test-Time Feature Normalization (TTFN) on test signals
-  2. SE-InceptionTime ensemble (F1-weighted TTA ×3 scales)
-  3. LightGBM ensemble on tabular features
-  4. Class-wise blend with optimized W vector
-  5. Argmax → submission_v10_ensemble.csv
+    REMOVED from v10 (v11 decommissions):
+      ✗ Test-Time Feature Normalization (TTFN) – completely removed
+      ✗ Manual probability blending (0.5×CNN + 0.5×GBDT)
+      ✗ OOF blending weight optimization (scipy L-BFGS-B)
 
 Usage
 ─────
     conda activate PyTorch
     python train.py               # fold 1 only
-    python train.py --all-folds   # full 5-fold CV + ensemble inference
+    python train.py --all-folds   # full 5-fold CV + stacking inference
 
 DO NOT run this script automatically – see task constraints.
 """
@@ -63,7 +61,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import kurtosis as scipy_kurtosis, skew as scipy_skew
-from scipy.optimize import minimize
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     f1_score, accuracy_score, classification_report, confusion_matrix
@@ -80,9 +77,8 @@ if not LGBM_AVAILABLE:
         "LightGBM is not installed. Please install: pip install lightgbm")
 
 from dataset import (
-    build_fold_datasets, build_test_dataset,
     load_all_samples, load_test_samples, get_fold_splits,
-    normalize, HARDataset,
+    normalize, compute_normalization_params, HARDataset,
     N_FOLDS, N_CLASSES,
 )
 from model import InceptionTime1D
@@ -118,7 +114,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v10_ensemble.csv",
+    "submission_path"   : "./submission_v11_stacking.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -139,7 +135,7 @@ CFG = {
 
     # Model (SE-InceptionTime) ────────────────────────────────────────────────
     "in_channels"       : 8,       # 8 stable channels
-    "nb_filters"        : 64,      # output channels per branch per block (v10 upgraded)
+    "nb_filters"        : 64,      # output channels per branch per block
     "bottleneck"        : 32,      # bottleneck projection dim
     "depth"             : 6,       # number of stacked SE-Inception blocks
     "se_reduction"      : 16,      # SE channel reduction ratio r
@@ -313,7 +309,7 @@ class EarlyStopping:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 4: Comprehensive Time-Frequency Feature Extractor (100+ features)
+# Module 4: Comprehensive Time-Frequency Feature Extractor (136 features)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _zero_crossing_rate(signal_1d: np.ndarray) -> float:
@@ -329,7 +325,9 @@ def _zero_crossing_rate(signal_1d: np.ndarray) -> float:
 
 def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
     """
-    Extract 100+ handcrafted time-frequency features from (N, 8, 300) signal windows.
+    Extract 136 handcrafted time-frequency features from (N, 8, 300) signal windows.
+
+    IMPORTANT: This function MUST be called on NORMALISED signals (post global Z-score).
 
     Feature layout per channel (17 features × 8 channels = 136 total):
     ─────────────────────────────────────────────────────────────────────
@@ -351,6 +349,7 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     signals_np : np.ndarray, shape (N, 8, 300)
+                 MUST be Z-score normalised (training-set reference).
 
     Returns
     -------
@@ -407,18 +406,19 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
 
 
 N_TAB_FEATURES = 136   # 17 features × 8 channels
+N_META_FEATURES = N_TAB_FEATURES + NUM_CLASSES   # 136 + 6 = 142
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 5: Global LightGBM Engine (6-class)
+# Module 5: LightGBM Meta-Learner (6-class, 142-dim stacked input)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_lgbm_model() -> lgb.LGBMClassifier:
-    """Instantiate a global 6-class LightGBM classifier with optimised defaults."""
+def build_meta_lgbm_model() -> lgb.LGBMClassifier:
+    """Instantiate a 6-class LightGBM meta-learner for the stacking layer."""
     return lgb.LGBMClassifier(
         objective        = "multiclass",
         num_class        = NUM_CLASSES,
-        n_estimators     = 800,
+        n_estimators     = 1000,
         learning_rate    = 0.05,
         max_depth        = 7,
         num_leaves       = 63,
@@ -433,19 +433,6 @@ def build_lgbm_model() -> lgb.LGBMClassifier:
         verbose          = -1,
         n_jobs           = -1,
     )
-
-
-def _collect_raw_signals_from_loader(loader) -> tuple:
-    """
-    Iterate a DataLoader and return concatenated raw signal arrays.
-    Returns (signals_np (N,8,300), labels_np (N,)).
-    """
-    all_signals, all_labels = [], []
-    for signals, labels in loader:
-        all_signals.append(signals.numpy())
-        all_labels.append(labels.numpy())
-    return (np.concatenate(all_signals, axis=0),
-            np.concatenate(all_labels,  axis=0))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -531,47 +518,71 @@ def format_confusion_matrix(all_labels, all_preds, label_names=None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase A: Per-fold SE-InceptionTime training (flat 6-class)
+# Phase A: Per-fold SE-InceptionTime training + OOF extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
 CLASS_NAMES = ["L0", "L1", "L2", "L3", "L4", "L5"]
 
 
-def train_fold_dl(fold_idx: int, device: torch.device, cfg: dict,
-                  logger: DualLogger):
+def train_fold_dl(fold_idx:    int,
+                  device:      torch.device,
+                  cfg:         dict,
+                  logger:      DualLogger,
+                  global_mean: np.ndarray,
+                  global_std:  np.ndarray,
+                  all_signals: np.ndarray,
+                  all_labels:  np.ndarray,
+                  all_groups:  np.ndarray):
     """
     Train one CV fold for the flat 6-class SE-InceptionTime.
+
+    Uses GLOBAL training-set normalisation parameters (not fold-specific).
 
     Returns
     -------
     best_val_f1     : float
-    norm_params     : (mean, std)
     checkpoint_path : str
     best_val_report : str
     oof_probs       : np.ndarray (N_val, 6)  – OOF probability matrix
     oof_labels      : np.ndarray (N_val,)    – true labels for this fold
-    val_indices     : np.ndarray (N_val,)    – absolute sample indices
+    val_idx         : np.ndarray (N_val,)    – absolute index positions in all_signals
     """
     fold_num = fold_idx + 1
 
     logger.log(f"\n[Phase A] --- Fold {fold_num}/{N_FOLDS} SE-InceptionTime Starting ---")
     logger.log_file("=" * 70)
     logger.log_file(f"PHASE A | FOLD {fold_num} / {N_FOLDS}  "
-                    f"– Flat 6-Class SE-InceptionTime")
+                    f"– Flat 6-Class SE-InceptionTime (Global Z-score Norm)")
     logger.log_file("=" * 70)
 
-    train_ds, val_ds, norm_params, class_counts, n_cls = build_fold_datasets(
-        cfg["train_root"], fold_idx=fold_idx, mode="flat"
-    )
+    # ── Split indices ──────────────────────────────────────────────────────────
+    train_idx, val_idx = get_fold_splits(all_signals, all_labels, all_groups, fold_idx)
 
-    logger.log_file(f"  Training samples  : {len(train_ds)}")
-    logger.log_file(f"  Validation samples: {len(val_ds)}")
+    # ── Apply GLOBAL normalisation (same reference for all folds) ─────────────
+    # signals are (N, 300, 8) → normalise to (N, 300, 8)
+    train_signals_norm = normalize(all_signals[train_idx], global_mean, global_std)
+    val_signals_norm   = normalize(all_signals[val_idx],   global_mean, global_std)
+
+    train_labels_fold = all_labels[train_idx]
+    val_labels_fold   = all_labels[val_idx]
+
+    # Class counts for focal loss alpha (from this fold's training labels)
+    class_counts = np.bincount(train_labels_fold, minlength=NUM_CLASSES)
+
+    logger.log_file(f"  Training samples  : {len(train_idx)}")
+    logger.log_file(f"  Validation samples: {len(val_idx)}")
     logger.log_file("  Class counts (train fold):")
     for c, cnt in enumerate(class_counts):
         logger.log_file(f"    {CLASS_NAMES[c]}: {cnt:>5d}  "
                         f"({cnt / max(class_counts.sum(), 1) * 100:.1f}%)")
-    logger.log_console(f"  [DL] Train: {len(train_ds)}  Val: {len(val_ds)}  "
+    logger.log_console(f"  [DL] Train: {len(train_idx)}  Val: {len(val_idx)}  "
                        f"Classes: {class_counts.tolist()}")
+
+    # ── Build Datasets & DataLoaders ──────────────────────────────────────────
+    train_ds = HARDataset(train_signals_norm, train_labels_fold,
+                          train_labels_fold, is_train=True)
+    val_ds   = HARDataset(val_signals_norm,   val_labels_fold,
+                          val_labels_fold,   is_train=False)
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
                               shuffle=True,  num_workers=cfg["num_workers"],
@@ -580,6 +591,7 @@ def train_fold_dl(fold_idx: int, device: torch.device, cfg: dict,
                               shuffle=False, num_workers=cfg["num_workers"],
                               pin_memory=cfg["pin_memory"])
 
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = InceptionTime1D(
         in_channels  = cfg["in_channels"],
         num_classes  = cfg["num_classes"],
@@ -593,6 +605,7 @@ def train_fold_dl(fold_idx: int, device: torch.device, cfg: dict,
                     f"depth={cfg['depth']}, SE r={cfg['se_reduction']})  "
                     f"|  Params: {n_params:,}")
 
+    # ── Loss, Optimizer, Scheduler ────────────────────────────────────────────
     criterion = build_focal_loss(
         class_counts, cfg["num_classes"], device,
         gamma=cfg["focal_gamma"],
@@ -606,13 +619,14 @@ def train_fold_dl(fold_idx: int, device: torch.device, cfg: dict,
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
     ckpt_path  = os.path.join(cfg["checkpoint_dir"],
-                              f"v10_fold_{fold_num}_best.pth")
+                              f"v11_fold_{fold_num}_best.pth")
     early_stop = EarlyStopping(patience=cfg["patience"], checkpoint_path=ckpt_path)
 
     best_val_preds  = (None, None)
     best_val_probs  = None
     best_val_report = ""
 
+    # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, cfg["epochs"] + 1):
         t_start    = time.time()
         train_loss = train_one_epoch(
@@ -673,281 +687,43 @@ def train_fold_dl(fold_idx: int, device: torch.device, cfg: dict,
     oof_labels = best_val_preds[1] if best_val_preds[1] is not None else np.array([])
     oof_probs  = best_val_probs   if best_val_probs   is not None else np.zeros((0, NUM_CLASSES))
 
-    return (early_stop.best_score, norm_params, ckpt_path,
-            best_val_report, oof_probs, oof_labels)
+    return (early_stop.best_score, ckpt_path,
+            best_val_report, oof_probs, oof_labels, val_idx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase B: Per-fold LightGBM training (flat 6-class)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def train_fold_gbdt(fold_idx: int, cfg: dict, logger: DualLogger):
-    """
-    Train one CV fold for the flat 6-class LightGBM engine.
-
-    Returns
-    -------
-    best_val_f1 : float
-    gbdt_model  : fitted LGBMClassifier
-    oof_probs   : np.ndarray (N_val, 6)  – OOF probability matrix
-    oof_labels  : np.ndarray (N_val,)    – true labels
-    """
-    fold_num = fold_idx + 1
-
-    logger.log(f"\n[Phase B] --- Fold {fold_num}/{N_FOLDS} LightGBM Starting ---")
-    logger.log_file("=" * 70)
-    logger.log_file(f"PHASE B | FOLD {fold_num} / {N_FOLDS}  "
-                    f"– Flat 6-Class LightGBM (100+ tabular features)")
-    logger.log_file("=" * 70)
-
-    # Reuse the same fold splits (flat mode)
-    train_ds, val_ds, _, class_counts, _ = build_fold_datasets(
-        cfg["train_root"], fold_idx=fold_idx, mode="flat"
-    )
-
-    # Collect raw signals (not normalised) for tabular feature extraction
-    train_loader_ord = DataLoader(train_ds, batch_size=512,
-                                  shuffle=False, num_workers=cfg["num_workers"],
-                                  pin_memory=False)
-    val_loader_ord   = DataLoader(val_ds,   batch_size=512,
-                                  shuffle=False, num_workers=cfg["num_workers"],
-                                  pin_memory=False)
-
-    train_signals_np, train_labels_np = _collect_raw_signals_from_loader(train_loader_ord)
-    val_signals_np,   val_labels_np   = _collect_raw_signals_from_loader(val_loader_ord)
-
-    logger.log(f"  [GBDT|Fold {fold_num}] Extracting tabular features "
-               f"({N_TAB_FEATURES} features per sample) ...")
-
-    t_feat = time.time()
-    X_train = extract_tabular_features(train_signals_np)   # (N_train, 136)
-    X_val   = extract_tabular_features(val_signals_np)     # (N_val,   136)
-    feat_elapsed = time.time() - t_feat
-
-    logger.log(f"  [GBDT|Fold {fold_num}] Feature extraction done: "
-               f"train={X_train.shape}, val={X_val.shape}  "
-               f"Time: {feat_elapsed:.1f}s")
-    logger.log_file(f"  Feature matrix: train={X_train.shape}  val={X_val.shape}")
-
-    gbdt_model = build_lgbm_model()
-
-    t_gbdt = time.time()
-    gbdt_model.fit(X_train, train_labels_np)
-    gbdt_elapsed = time.time() - t_gbdt
-
-    # OOF predictions
-    oof_probs  = gbdt_model.predict_proba(X_val)           # (N_val, 6)
-    oof_preds  = oof_probs.argmax(axis=1)
-    gbdt_val_f1  = f1_score(val_labels_np, oof_preds, average="macro", zero_division=0)
-    gbdt_val_acc = accuracy_score(val_labels_np, oof_preds) * 100.0
-
-    logger.log(f"  [GBDT|Fold {fold_num}] LightGBM Val Macro F1: {gbdt_val_f1:.4f}  "
-               f"Acc: {gbdt_val_acc:.2f}%  Train time: {gbdt_elapsed:.1f}s")
-    logger.log_file(f"  [GBDT|Fold {fold_num}] LightGBM Val Macro F1: {gbdt_val_f1:.6f}  "
-                    f"Acc: {gbdt_val_acc:.4f}%  Train time: {gbdt_elapsed:.2f}s")
-    logger.log_file(f"  [GBDT|Fold {fold_num}] Classification Report:")
-    logger.log_file(classification_report(
-        val_labels_np, oof_preds, target_names=CLASS_NAMES,
-        digits=4, zero_division=0))
-    logger.log_file("─" * 70)
-
-    return gbdt_val_f1, gbdt_model, oof_probs, val_labels_np
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Module 6: 6-class OOF Blending Vector Optimization
-# ══════════════════════════════════════════════════════════════════════════════
-
-def optimize_blend_weights(oof_probs_dl:   np.ndarray,
-                           oof_probs_gbdt: np.ndarray,
-                           oof_labels:     np.ndarray,
-                           logger:         DualLogger) -> np.ndarray:
-    """
-    Search for an optimal 6-dimensional blending weight vector W ∈ [0,1]^6
-    that maximizes the global validation Macro F1 score.
-
-    Blending rule:
-        P_blend[c] = w_c × P_CNN[c] + (1 - w_c) × P_GBDT[c]
-
-    Uses scipy.optimize.minimize (L-BFGS-B) with random multi-start restarts
-    to escape local optima.
-
-    Parameters
-    ----------
-    oof_probs_dl   : (N_val_total, 6) – accumulated DL OOF probs
-    oof_probs_gbdt : (N_val_total, 6) – accumulated GBDT OOF probs
-    oof_labels     : (N_val_total,)   – true integer labels
-
-    Returns
-    -------
-    best_w : np.ndarray, shape (6,)
-             Optimal weight vector W where w_c ∈ [0, 1]
-    """
-    logger.log("\n" + "=" * 70)
-    logger.log("  OOF BLENDING WEIGHT OPTIMIZATION  (6-dimensional search)")
-    logger.log("=" * 70)
-    logger.log(f"  OOF samples: {len(oof_labels)}  "
-               f"DL shape: {oof_probs_dl.shape}  "
-               f"GBDT shape: {oof_probs_gbdt.shape}")
-
-    # Baseline: pure DL
-    preds_dl   = oof_probs_dl.argmax(axis=1)
-    f1_dl      = f1_score(oof_labels, preds_dl, average="macro", zero_division=0)
-    # Baseline: pure GBDT
-    preds_gbdt = oof_probs_gbdt.argmax(axis=1)
-    f1_gbdt    = f1_score(oof_labels, preds_gbdt, average="macro", zero_division=0)
-    # Equal blend
-    blend_eq   = 0.5 * oof_probs_dl + 0.5 * oof_probs_gbdt
-    f1_eq      = f1_score(oof_labels, blend_eq.argmax(axis=1),
-                          average="macro", zero_division=0)
-
-    logger.log(f"  Baseline — Pure DL  F1: {f1_dl:.6f}")
-    logger.log(f"  Baseline — Pure GBDT F1: {f1_gbdt:.6f}")
-    logger.log(f"  Baseline — Equal Blend (0.5) F1: {f1_eq:.6f}")
-
-    def neg_macro_f1(w: np.ndarray) -> float:
-        """Objective: negative macro F1 (minimized by scipy)."""
-        w_clipped = np.clip(w, 0.0, 1.0)
-        # Class-wise blend: P_blend[:, c] = w[c]*P_dl[:, c] + (1-w[c])*P_gbdt[:, c]
-        blend = w_clipped[np.newaxis, :] * oof_probs_dl + \
-                (1.0 - w_clipped)[np.newaxis, :] * oof_probs_gbdt
-        preds = blend.argmax(axis=1)
-        return -f1_score(oof_labels, preds, average="macro", zero_division=0)
-
-    bounds = [(0.0, 1.0)] * NUM_CLASSES
-
-    best_result = None
-    best_f1     = -np.inf
-
-    # Multi-start random restarts (20 starts for thorough search)
-    rng = np.random.RandomState(42)
-    n_starts = 20
-    logger.log(f"\n  Running L-BFGS-B optimization with {n_starts} random restarts ...")
-
-    for start_idx in range(n_starts):
-        if start_idx == 0:
-            w0 = np.full(NUM_CLASSES, 0.5)    # start from equal blend
-        elif start_idx == 1:
-            w0 = np.ones(NUM_CLASSES) * 0.8   # DL-heavy start
-        elif start_idx == 2:
-            w0 = np.ones(NUM_CLASSES) * 0.2   # GBDT-heavy start
-        else:
-            w0 = rng.uniform(0.0, 1.0, NUM_CLASSES)
-
-        try:
-            result = minimize(neg_macro_f1, w0, method="L-BFGS-B", bounds=bounds,
-                              options={"maxiter": 1000, "ftol": 1e-12, "gtol": 1e-8})
-            candidate_f1 = -result.fun
-            if candidate_f1 > best_f1:
-                best_f1     = candidate_f1
-                best_result = result
-        except Exception:
-            continue
-
-    if best_result is None:
-        logger.log("  WARNING: Optimizer failed all starts. Falling back to equal blend.")
-        best_w = np.full(NUM_CLASSES, 0.5)
-        best_f1 = f1_eq
-    else:
-        best_w = np.clip(best_result.x, 0.0, 1.0)
-
-    logger.log(f"\n  Optimized Blending Weight Vector W:")
-    for c in range(NUM_CLASSES):
-        logger.log(f"    w_{c} ({CLASS_NAMES[c]}): {best_w[c]:.6f}  "
-                   f"→ P_blend = {best_w[c]:.4f}×P_CNN + "
-                   f"{1-best_w[c]:.4f}×P_GBDT")
-    logger.log(f"\n  OOF Macro F1 with optimized W: {best_f1:.6f}")
-    logger.log(f"  Improvement over pure DL  : {best_f1 - f1_dl:+.6f}")
-    logger.log(f"  Improvement over pure GBDT: {best_f1 - f1_gbdt:+.6f}")
-    logger.log(f"  Improvement over 0.5 blend: {best_f1 - f1_eq:+.6f}")
-
-    return best_w
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Module 7: Flat 6-Class Blending Inference with TTFN
+# Test set CNN probability accumulation (Phase A inference)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def flat_ensemble_inference(dl_fold_results:   list,
-                             gbdt_fold_results: list,
-                             blend_weights:     np.ndarray,
-                             cfg:               dict,
-                             device:            torch.device,
-                             logger:            DualLogger) -> pd.DataFrame:
+def accumulate_test_cnn_probs(dl_fold_results: list,
+                               normed_test:     np.ndarray,
+                               cfg:             dict,
+                               device:          torch.device,
+                               logger:          DualLogger) -> np.ndarray:
     """
-    Flat 6-class blending inference pipeline (v10).
-
-    Step 1: Test-Time Feature Normalization (TTFN) – intrinsic Z-score on test batch
-    Step 2: SE-InceptionTime ensemble (F1-weighted TTA ×3 scales) → (N, 6) probs
-    Step 3: LightGBM ensemble on tabular features → (N, 6) probs
-    Step 4: Class-wise blend via optimized W vector
-    Step 5: Argmax → submission_v10_ensemble.csv
+    Run test inference across all trained fold models with TTA (×0.95, ×1.00, ×1.05).
+    Returns arithmetic mean of all fold/TTA outputs: (N_test, 6).
 
     Parameters
     ----------
-    dl_fold_results   : list of (fold_idx, best_f1, norm_params, ckpt_path, report, oof_p, oof_l)
-    gbdt_fold_results : list of (fold_idx, best_f1, gbdt_model, oof_p, oof_l)
-    blend_weights     : np.ndarray (6,) – optimized class-wise weight vector W
-    cfg               : dict
-    device            : torch.device
-    logger            : DualLogger
-
-    Returns
-    -------
-    submission : pd.DataFrame  with columns ['Id', 'Label']
+    dl_fold_results : list of (fold_idx, best_f1, ckpt_path, report, oof_p, oof_l, val_idx)
+    normed_test     : np.ndarray (N_test, 8, 300) – globally normalised (C, L) ordering
     """
-    logger.log("\n" + "=" * 70)
-    logger.log("  FLAT 6-CLASS BLENDING INFERENCE  (SE-InceptionTime + LightGBM + TTFN)")
-    logger.log("=" * 70)
+    n_test     = normed_test.shape[0]
+    prob_accum = np.zeros((n_test, NUM_CLASSES), dtype=np.float64)
+    n_accum    = 0
 
-    # ── Test-Time Feature Normalization ──────────────────────────────────────
-    logger.log("\n  [TTFN] Loading test data with intrinsic Z-score normalisation ...")
+    test_tensor    = torch.from_numpy(normed_test.astype(np.float32))
+    dummy_labels   = torch.zeros(n_test, dtype=torch.long)
+    test_ds        = TensorDataset(test_tensor, dummy_labels)
+    test_loader    = DataLoader(test_ds, batch_size=cfg["batch_size"] * 2,
+                                shuffle=False, num_workers=cfg["num_workers"],
+                                pin_memory=cfg["pin_memory"])
 
-    raw_test_signals_300_8, file_ids = load_test_samples(cfg["test_root"])
-
-    # Transpose to (N, 8, 300)
-    raw_test_signals = raw_test_signals_300_8.transpose(0, 2, 1).astype(np.float32)
-    n_test = raw_test_signals.shape[0]
-
-    # Compute per-channel mean and std across test batch: (8, N*300)
-    test_flat = raw_test_signals.transpose(1, 0, 2).reshape(8, -1)
-    test_mean = test_flat.mean(axis=1, keepdims=True)   # (8, 1)
-    test_std  = test_flat.std(axis=1,  keepdims=True)   # (8, 1)
-    test_std  = np.where(test_std < 1e-8, 1.0, test_std)
-
-    # Intrinsic standardisation: (N, 8, 300)
-    normed_test = (raw_test_signals - test_mean[np.newaxis, :, :]) / \
-                   test_std[np.newaxis, :, :]
-    normed_test = normed_test.astype(np.float32)
-
-    logger.log(f"  [TTFN] N_test={n_test}  "
-               f"Per-channel mean: {np.round(test_mean.squeeze(), 4).tolist()}")
-    logger.log(f"  [TTFN] Per-channel std:  {np.round(test_std.squeeze(), 4).tolist()}")
-
-    # Build DataLoader from normalised test tensor
-    normed_tensor   = torch.from_numpy(normed_test)
-    dummy_labels    = torch.zeros(n_test, dtype=torch.long)
-    normed_test_ds  = TensorDataset(normed_tensor, dummy_labels)
-    normed_test_loader = DataLoader(
-        normed_test_ds,
-        batch_size  = cfg["batch_size"] * 2,
-        shuffle     = False,
-        num_workers = cfg["num_workers"],
-        pin_memory  = cfg["pin_memory"],
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2: SE-InceptionTime ensemble (F1-weighted TTA ×3 scales)
-    # ══════════════════════════════════════════════════════════════════════════
-    logger.log("\n  [Step 2] SE-InceptionTime Ensemble ...")
-
-    dl_weighted_prob_sum = np.zeros((n_test, NUM_CLASSES), dtype=np.float64)
-    dl_f1_total          = 0.0
-
-    for fold_idx, best_f1, norm_params, ckpt_path, _, _, _ in dl_fold_results:
+    for fold_idx, best_f1, ckpt_path, _, _, _, _ in dl_fold_results:
         fold_num = fold_idx + 1
-        logger.log(f"    DL Fold {fold_num}: loading {ckpt_path}  "
+        logger.log(f"    [CNN Test] Fold {fold_num}: loading {ckpt_path}  "
                    f"(Val F1={best_f1:.6f})")
 
         model = InceptionTime1D(
@@ -963,95 +739,185 @@ def flat_ensemble_inference(dl_fold_results:   list,
         model.eval()
 
         fold_probs = []
-        for signals, _ in normed_test_loader:
+        for signals, _ in test_loader:
             x      = signals.to(device, non_blocking=True)
             # TTA: original / scale-up (+5%) / scale-down (−5%)
-            p_orig = F.softmax(model(x),        dim=1)
-            p_up   = F.softmax(model(x * 1.05), dim=1)
-            p_down = F.softmax(model(x * 0.95), dim=1)
+            p_orig = F.softmax(model(x),        dim=1).cpu().numpy()
+            p_up   = F.softmax(model(x * 1.05), dim=1).cpu().numpy()
+            p_down = F.softmax(model(x * 0.95), dim=1).cpu().numpy()
             p_tta  = (p_orig + p_up + p_down) / 3.0
-            fold_probs.append(p_tta.cpu().numpy())
+            fold_probs.append(p_tta)
 
-        fold_probs_arr        = np.concatenate(fold_probs, axis=0)   # (N, 6)
-        dl_weighted_prob_sum += best_f1 * fold_probs_arr
-        dl_f1_total          += best_f1
-        logger.log(f"      → accumulated (weight={best_f1:.6f})")
+        fold_probs_arr  = np.concatenate(fold_probs, axis=0)   # (N_test, 6)
+        prob_accum     += fold_probs_arr
+        n_accum        += 1
+        logger.log(f"      → TTA probs accumulated (fold {fold_num})")
 
-    if dl_f1_total > 0.0:
-        p_dl = dl_weighted_prob_sum / dl_f1_total   # (N, 6)
+    if n_accum > 0:
+        avg_test_probs = prob_accum / n_accum   # arithmetic mean (N_test, 6)
     else:
-        logger.log("  WARNING: No valid DL folds. P_DL defaults to uniform.")
-        p_dl = np.full((n_test, NUM_CLASSES), 1.0 / NUM_CLASSES, dtype=np.float64)
+        logger.log("  WARNING: No valid DL folds. CNN test probs default to uniform.")
+        avg_test_probs = np.full((n_test, NUM_CLASSES),
+                                  1.0 / NUM_CLASSES, dtype=np.float64)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 3: LightGBM ensemble on tabular features
-    # ══════════════════════════════════════════════════════════════════════════
-    logger.log("\n  [Step 3] LightGBM Tabular Feature Ensemble ...")
+    return avg_test_probs.astype(np.float32)
 
-    # Extract tabular features from raw (un-normalised) test signals
-    logger.log(f"    Extracting {N_TAB_FEATURES} tabular features from test set ...")
-    t_feat = time.time()
-    X_test_tab = extract_tabular_features(raw_test_signals)   # (N, 136)
-    logger.log(f"    Feature extraction done: {X_test_tab.shape}  "
-               f"Time: {time.time()-t_feat:.1f}s")
 
-    gbdt_weighted_prob_sum = np.zeros((n_test, NUM_CLASSES), dtype=np.float64)
-    gbdt_f1_total          = 0.0
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase C: LightGBM Meta-Learner Stacking
+# ══════════════════════════════════════════════════════════════════════════════
 
-    for fold_idx, best_f1, gbdt_model, _, _ in gbdt_fold_results:
+def train_meta_lgbm(meta_X_train: np.ndarray,
+                    meta_y_train: np.ndarray,
+                    meta_X_test:  np.ndarray,
+                    all_signals_train_norm_CL: np.ndarray,
+                    all_labels:   np.ndarray,
+                    folds_to_run: list,
+                    all_groups:   np.ndarray,
+                    cfg:          dict,
+                    logger:       DualLogger) -> np.ndarray:
+    """
+    Train a 5-fold LightGBM meta-learner on the 142-dimensional stacked meta-space.
+
+    Parameters
+    ----------
+    meta_X_train : (N_train, 142) – CNN OOF probs (6) + tabular features (136)
+    meta_y_train : (N_train,)     – true labels
+    meta_X_test  : (N_test, 142)  – CNN test probs (6) + tabular features (136)
+    all_signals_train_norm_CL : (N_train, 8, 300) – for group structure reference
+    all_labels   : (N_train,)     – aligned labels (same ordering as meta_X_train)
+    folds_to_run : list of fold indices
+    all_groups   : (N_train,)     – user group IDs (no test set contamination)
+    cfg          : dict
+    logger       : DualLogger
+
+    Returns
+    -------
+    test_preds_final : np.ndarray (N_test,) – argmax predictions
+    """
+    logger.log("\n" + "═" * 70)
+    logger.log("  PHASE C – LightGBM Meta-Learner Stacking (142-dim)")
+    logger.log("═" * 70)
+    logger.log(f"  Meta-feature matrix shape: train={meta_X_train.shape}  "
+               f"test={meta_X_test.shape}")
+    logger.log(f"  Feature breakdown: {NUM_CLASSES} CNN OOF probs + "
+               f"{N_TAB_FEATURES} tabular = {N_META_FEATURES} total")
+
+    from sklearn.model_selection import StratifiedGroupKFold
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    splits = list(sgkf.split(meta_X_train, meta_y_train, groups=all_groups))
+
+    meta_oof_preds  = np.zeros(len(meta_y_train), dtype=np.int64)
+    meta_test_probs = np.zeros((meta_X_test.shape[0], NUM_CLASSES), dtype=np.float64)
+    meta_f1_scores  = []
+    meta_models     = []
+
+    folds_iter = folds_to_run if folds_to_run else list(range(N_FOLDS))
+
+    for fold_idx in folds_iter:
         fold_num = fold_idx + 1
-        if gbdt_model is None or best_f1 <= 0.0:
-            logger.log(f"    GBDT Fold {fold_num}: model not available – skipping.")
-            continue
-        logger.log(f"    GBDT Fold {fold_num}: predicting  (Val F1={best_f1:.6f})")
+        tr_idx, vl_idx = splits[fold_idx]
 
-        fold_gbdt_probs        = gbdt_model.predict_proba(X_test_tab)  # (N, 6)
-        gbdt_weighted_prob_sum += best_f1 * fold_gbdt_probs
-        gbdt_f1_total          += best_f1
-        logger.log(f"      → accumulated (weight={best_f1:.6f})")
+        X_tr = meta_X_train[tr_idx]
+        y_tr = meta_y_train[tr_idx]
+        X_vl = meta_X_train[vl_idx]
+        y_vl = meta_y_train[vl_idx]
 
-    if gbdt_f1_total > 0.0:
-        p_gbdt = gbdt_weighted_prob_sum / gbdt_f1_total   # (N, 6)
-    else:
-        logger.log("  WARNING: No valid GBDT folds. P_GBDT defaults to uniform.")
-        p_gbdt = np.full((n_test, NUM_CLASSES), 1.0 / NUM_CLASSES, dtype=np.float64)
+        logger.log(f"\n  [Meta-LGB] Fold {fold_num}/{N_FOLDS}  "
+                   f"train={len(tr_idx)}  val={len(vl_idx)}")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4: Class-wise blend with optimized W
-    # ══════════════════════════════════════════════════════════════════════════
-    logger.log("\n  [Step 4] Class-wise blending with optimized W ...")
-    logger.log(f"    W = {np.round(blend_weights, 6).tolist()}")
+        meta_model = build_meta_lgbm_model()
 
-    # P_final[c] = w_c × P_CNN[c] + (1-w_c) × P_GBDT[c]
-    p_final = (blend_weights[np.newaxis, :] * p_dl +
-               (1.0 - blend_weights)[np.newaxis, :] * p_gbdt)   # (N, 6)
+        t_start = time.time()
+        meta_model.fit(X_tr, y_tr)
+        elapsed = time.time() - t_start
 
-    # ── Argmax → final label predictions ─────────────────────────────────────
-    final_preds = p_final.argmax(axis=1).astype(np.int64)   # (N,)
+        vl_probs  = meta_model.predict_proba(X_vl)     # (N_val, 6)
+        vl_preds  = vl_probs.argmax(axis=1)
+        fold_f1   = f1_score(y_vl, vl_preds, average="macro", zero_division=0)
+        fold_acc  = accuracy_score(y_vl, vl_preds) * 100.0
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5: Assemble and save submission
-    # ══════════════════════════════════════════════════════════════════════════
-    submission = (
-        pd.DataFrame({"Id": file_ids, "Label": final_preds})
-        .sort_values("Id")
-        .reset_index(drop=True)
-    )
-    submission.to_csv(cfg["submission_path"], index=False)
+        meta_oof_preds[vl_idx] = vl_preds
+        meta_f1_scores.append(fold_f1)
+        meta_models.append(meta_model)
 
-    logger.log(f"\n  ── Submission Summary ──────────────────────────────────────────")
-    logger.log(f"  DL  folds used    : {len(dl_fold_results)}")
-    logger.log(f"  GBDT folds used   : {len(gbdt_fold_results)}")
-    logger.log(f"  Total test samples: {n_test}")
-    logger.log(f"  Submission path   : {cfg['submission_path']}")
-    pred_dist = submission["Label"].value_counts().sort_index()
-    logger.log("  Final predicted label distribution:")
-    for lbl, cnt in pred_dist.items():
-        lbl_name = CLASS_NAMES[int(lbl)] if int(lbl) < len(CLASS_NAMES) else str(lbl)
-        logger.log(f"    {lbl_name} (Label {lbl}): {cnt:>5d}  "
-                   f"({cnt / n_test * 100:.1f}%)")
+        # Accumulate test predictions from this fold
+        meta_test_probs += meta_model.predict_proba(meta_X_test)
 
-    return submission
+        logger.log(f"  [Meta-LGB|Fold {fold_num}] Val Macro F1: {fold_f1:.4f}  "
+                   f"Acc: {fold_acc:.2f}%  Train time: {elapsed:.1f}s")
+        logger.log_file(f"  [Meta-LGB|Fold {fold_num}] Val Macro F1: {fold_f1:.6f}  "
+                        f"Acc: {fold_acc:.4f}%  Train time: {elapsed:.2f}s")
+        logger.log_file(f"  [Meta-LGB|Fold {fold_num}] Classification Report:")
+        logger.log_file(classification_report(
+            y_vl, vl_preds, target_names=CLASS_NAMES,
+            digits=4, zero_division=0))
+        logger.log_file("─" * 70)
+
+        # Feature importances for this fold
+        fi = meta_model.feature_importances_
+        # Build feature names: cnn_prob_L0..L5 + tabular features
+        feat_names = [f"cnn_prob_{CLASS_NAMES[c]}" for c in range(NUM_CLASSES)]
+        feat_names += [f"tab_ch{ch}_{stat}" for ch in range(8)
+                       for stat in ["mean","std","median","max","min","var",
+                                    "skew","kurt","q25","q75",
+                                    "deriv_mean","deriv_std","deriv_zcr","deriv_energy",
+                                    "fft_dc","fft_max_amp","fft_energy"]]
+        fi_pairs = sorted(zip(feat_names, fi), key=lambda x: x[1], reverse=True)
+        top20_str = "\n".join(
+            f"    {rank+1:>2}. {nm:<38s} {imp:>8d}"
+            for rank, (nm, imp) in enumerate(fi_pairs[:20])
+        )
+        logger.log_file(f"\n  [Meta-LGB|Fold {fold_num}] Top-20 Feature Importances "
+                        f"(gain split):\n{top20_str}")
+
+    # ── Phase C summary ───────────────────────────────────────────────────────
+    logger.log("\n" + "═" * 70)
+    logger.log("  PHASE C SUMMARY – LightGBM Meta-Learner CV")
+    logger.log("═" * 70)
+    for fi_idx, f1_val in enumerate(meta_f1_scores):
+        logger.log(f"  [Meta-LGB] Fold {folds_iter[fi_idx]+1}:  Val Macro F1 = {f1_val:.6f}")
+    logger.log(f"\n  [Meta-LGB] Mean F1 = {np.mean(meta_f1_scores):.6f}  "
+               f"±  {np.std(meta_f1_scores):.6f}")
+
+    # OOF F1 (full meta-OOF, only meaningful when all 5 folds are run)
+    oof_f1 = f1_score(meta_y_train, meta_oof_preds, average="macro", zero_division=0)
+    logger.log(f"  [Meta-LGB] OOF Macro F1 (all folds combined): {oof_f1:.6f}")
+
+    if len(meta_all_labels := meta_y_train) > 0:
+        cm_text = format_confusion_matrix(
+            meta_y_train.tolist(), meta_oof_preds.tolist(), CLASS_NAMES)
+        logger.log_file("\n--- [Meta-LGB] OOF Confusion Matrix ---")
+        logger.log_file(cm_text)
+        logger.log("\n--- [Meta-LGB] OOF Confusion Matrix ---")
+        logger.log(cm_text)
+
+    # ── Aggregate test predictions (mean over trained folds) ──────────────────
+    n_folds_used = max(len(folds_iter), 1)
+    avg_test_meta_probs = meta_test_probs / n_folds_used   # (N_test, 6)
+    test_preds_final    = avg_test_meta_probs.argmax(axis=1).astype(np.int64)
+
+    # ── Log aggregate feature importances across all meta-folds ──────────────
+    logger.log("\n")
+    logger.log("  [Meta-LGB] Aggregate Feature Importances (mean across folds):")
+    feat_names_base = [f"cnn_prob_{CLASS_NAMES[c]}" for c in range(NUM_CLASSES)]
+    feat_names_base += [f"tab_ch{ch}_{stat}" for ch in range(8)
+                        for stat in ["mean","std","median","max","min","var",
+                                     "skew","kurt","q25","q75",
+                                     "deriv_mean","deriv_std","deriv_zcr","deriv_energy",
+                                     "fft_dc","fft_max_amp","fft_energy"]]
+    fi_sum = np.zeros(N_META_FEATURES, dtype=np.float64)
+    for mm in meta_models:
+        fi_sum += mm.feature_importances_.astype(np.float64)
+    fi_mean   = fi_sum / max(len(meta_models), 1)
+    fi_pairs_agg = sorted(zip(feat_names_base, fi_mean),
+                          key=lambda x: x[1], reverse=True)
+    logger.log(f"  {'Rank':<5} {'Feature Name':<42} {'Avg Importance':>14}")
+    logger.log("  " + "─" * 65)
+    for rank, (nm, imp) in enumerate(fi_pairs_agg[:20]):
+        logger.log(f"  {rank+1:>4}. {nm:<42} {imp:>14.2f}")
+
+    return test_preds_final
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1060,7 +926,7 @@ def flat_ensemble_inference(dl_fold_results:   list,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HAR SE-InceptionTime v10 – Flat 6-Class + GBDT Ensemble + OOF Blend")
+        description="HAR SE-InceptionTime v11 – OOF Stacking + LightGBM Meta-Learner")
     parser.add_argument("--all-folds",  action="store_true",
                         help="Run all 5 folds (default: fold 1 only)")
     parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
@@ -1082,9 +948,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Header ────────────────────────────────────────────────────────────────
+    hidden_dim = CFG["nb_filters"] * 4
     header_lines = [
         "=" * 70,
-        "  HAR SE-InceptionTime v10 – Flat 6-Class Heterogeneous Ensemble + TTFN",
+        "  HAR SE-InceptionTime v11 – OOF Stacking + LightGBM Meta-Learner",
+        "  (TTFN REMOVED | Global Z-score Norm | 142-dim Meta-Space)",
         "=" * 70,
         f"  Log file      : {os.path.abspath(CFG['log_path'])}",
         f"  Device        : {device}",
@@ -1095,7 +963,6 @@ def main():
             f"  VRAM          : "
             f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
         ]
-    hidden_dim = CFG["nb_filters"] * 4
     header_lines += [
         f"  Seed          : {CFG['seed']}  (deterministic=True, benchmark=False)",
         f"  Architecture  : SE-InceptionTime1D (flat 6-class, SE block per Inception block)",
@@ -1107,10 +974,13 @@ def main():
         f"  Depth         : {CFG['depth']}  (SE-Inception blocks; residual every 3)",
         f"  SE reduction  : r={CFG['se_reduction']}",
         f"  Num classes   : {CFG['num_classes']}  (L0 | L1 | L2 | L3 | L4 | L5 – flat)",
-        f"  GBDT Engine   : LightGBM ({N_TAB_FEATURES} tabular features: "
-        f"17 per channel × 8 channels)",
-        f"  Feature types : Time-stats(10) + Derivative(4) + FFT(3) per channel",
-        f"  Blend Optimizer: scipy L-BFGS-B (20 random restarts, 6D weight vector)",
+        f"  Normalisation : GLOBAL training-set Z-score (NO per-test TTFN)",
+        f"  Meta Features : {NUM_CLASSES} CNN OOF probs + {N_TAB_FEATURES} tabular "
+        f"= {N_META_FEATURES} dims",
+        f"  Meta-Learner  : LightGBM 5-fold CV (n_estimators=1000)",
+        f"  Tabular feat  : 17 per channel × 8 channels (extracted post-normalisation)",
+        f"  CNN TTA       : ×0.95 / ×1.00 / ×1.05 arithmetic mean",
+        f"  Blend logic   : NONE (meta-learner argmax only, no manual weighting)",
         f"  Epochs        : {CFG['epochs']}",
         f"  Batch         : {CFG['batch_size']}",
         f"  LR            : {CFG['lr']}",
@@ -1120,8 +990,6 @@ def main():
         f"  Mixup α       : {CFG['mixup_alpha']}",
         f"  Patience      : {CFG['patience']}",
         f"  Folds         : {'all 5' if CFG['run_all_folds'] else 'fold 1 only'}",
-        f"  DL Ensemble   : F1-Weighted TTA (×1.00 / ×1.05 / ×0.95)",
-        f"  Domain Adapt  : Test-Time Feature Normalisation (intrinsic Z-score)",
         f"  Submission    : {CFG['submission_path']}",
         "=" * 70,
     ]
@@ -1130,33 +998,79 @@ def main():
 
     folds_to_run = list(range(N_FOLDS)) if CFG["run_all_folds"] else [0]
 
-    # Accumulators for OOF matrices (filled across all folds)
-    oof_probs_dl_list   = []   # Each entry: (N_val, 6)
-    oof_probs_gbdt_list = []   # Each entry: (N_val, 6)
-    oof_labels_list     = []   # Each entry: (N_val,)
-
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE A – Train SE-InceptionTime (flat 6-class)
+    # STEP 0: Load ALL training samples & compute GLOBAL normalisation
     # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE A – SE-InceptionTime Training (Flat 6-Class)")
+    logger.log("  STEP 0 – Global Data Loading & Training-Set Reference Normalisation")
+    logger.log("═" * 70)
+
+    t0_start = time.time()
+    all_signals, all_labels, all_groups, all_file_ids = load_all_samples(CFG["train_root"])
+
+    # Compute global Z-score statistics from the complete training set
+    # This is the SINGLE reference scaler applied to ALL splits (train/val/test)
+    global_mean, global_std = compute_normalization_params(all_signals)
+
+    logger.log(f"  Total training samples loaded: {len(all_signals)}")
+    logger.log(f"  Signal shape: {all_signals.shape}  (N, timesteps, channels)")
+    logger.log(f"  Global mean  (8 channels): {np.round(global_mean, 6).tolist()}")
+    logger.log(f"  Global std   (8 channels): {np.round(global_std,  6).tolist()}")
+    logger.log(f"  Label distribution:")
+    for c in range(NUM_CLASSES):
+        cnt = int((all_labels == c).sum())
+        logger.log(f"    {CLASS_NAMES[c]}: {cnt:>5d}  "
+                   f"({cnt / len(all_labels) * 100:.1f}%)")
+
+    # Load test samples (NOT normalised yet)
+    raw_test_signals, test_file_ids = load_test_samples(CFG["test_root"])
+    n_test = raw_test_signals.shape[0]
+    logger.log(f"\n  Test samples loaded: {n_test}  shape: {raw_test_signals.shape}")
+
+    # Apply GLOBAL training-set normalisation to test signals
+    # raw_test_signals is (N, 300, 8), normalize returns (N, 300, 8)
+    normed_test_signals = normalize(raw_test_signals, global_mean, global_std)
+
+    # Transpose to (N, 8, 300) for CNN input format
+    normed_test_CL = normed_test_signals.transpose(0, 2, 1).astype(np.float32)
+
+    logger.log(f"  Test signals normalised using global training-set parameters.")
+    logger.log(f"  Data loading & normalisation elapsed: "
+               f"{time.time() - t0_start:.1f}s")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE A – Train SE-InceptionTime (flat 6-class) & Extract OOF Probs
+    # ════════════════════════════════════════════════════════════════════════
+    logger.log("\n" + "═" * 70)
+    logger.log("  PHASE A – SE-InceptionTime Training (Flat 6-Class) + OOF Extraction")
     logger.log("═" * 70)
 
     t_phaseA_start = time.time()
     dl_fold_results = []
-    dl_all_preds    = []
-    dl_all_labels   = []
+
+    # OOF probability matrix for the entire training set: (N_train, 6)
+    # Indexed by absolute position in all_signals
+    oof_cnn_probs_full  = np.zeros((len(all_signals), NUM_CLASSES), dtype=np.float32)
+    oof_idx_covered     = np.zeros(len(all_signals), dtype=bool)
+
+    dl_all_preds  = []
+    dl_all_labels = []
 
     for fold_idx in folds_to_run:
-        (best_f1, norm_params, ckpt_path, report,
-         oof_probs, oof_labels) = train_fold_dl(fold_idx, device, CFG, logger)
+        (best_f1, ckpt_path, report,
+         oof_probs, oof_labels, val_idx) = train_fold_dl(
+            fold_idx, device, CFG, logger,
+            global_mean, global_std,
+            all_signals, all_labels, all_groups,
+        )
 
         dl_fold_results.append(
-            (fold_idx, best_f1, norm_params, ckpt_path, report, oof_probs, oof_labels))
+            (fold_idx, best_f1, ckpt_path, report, oof_probs, oof_labels, val_idx))
 
+        # Fill OOF probability slots at the validation indices
         if oof_probs is not None and len(oof_probs) > 0:
-            oof_probs_dl_list.append(oof_probs)
-            oof_labels_list.append(oof_labels)
+            oof_cnn_probs_full[val_idx] = oof_probs
+            oof_idx_covered[val_idx]    = True
             dl_all_preds.extend(oof_probs.argmax(axis=1).tolist())
             dl_all_labels.extend(oof_labels.tolist())
 
@@ -1170,114 +1084,150 @@ def main():
         logger.log(f"  [DL] Fold {fi+1}:  Best Val Macro F1 = {bf1:.6f}")
     logger.log(f"\n  [DL] Mean F1 = {np.mean(dl_f1_scores):.6f}  "
                f"±  {np.std(dl_f1_scores):.6f}")
+    logger.log(f"  OOF slots filled: {oof_idx_covered.sum()} / {len(all_signals)}")
     logger.log(f"  Phase A wall-clock: {t_phaseA / 60:.1f} min")
 
     if len(dl_all_labels) > 0:
         cm_text = format_confusion_matrix(
             dl_all_labels, dl_all_preds, CLASS_NAMES)
-        logger.log_file("\n--- [DL] Aggregate Confusion Matrix ---")
+        logger.log_file("\n--- [DL] Aggregate OOF Confusion Matrix ---")
         logger.log_file(cm_text)
-        logger.log("\n--- [DL] Aggregate Confusion Matrix ---")
+        logger.log("\n--- [DL] Aggregate OOF Confusion Matrix ---")
         logger.log(cm_text)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE B – Train LightGBM (flat 6-class)
+    # PHASE A (cont.) – Accumulate Test CNN Probabilities
+    # ════════════════════════════════════════════════════════════════════════
+    logger.log("\n" + "─" * 70)
+    logger.log("  PHASE A (Test) – Accumulating CNN Test Probabilities (TTA × 5 folds)")
+    logger.log("─" * 70)
+
+    t_cnn_test = time.time()
+    cnn_test_probs = accumulate_test_cnn_probs(
+        dl_fold_results, normed_test_CL, CFG, device, logger)
+    logger.log(f"  CNN test probs aggregated: {cnn_test_probs.shape}  "
+               f"({time.time() - t_cnn_test:.1f}s)")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE B – Post-Normalisation Tabular Feature Extraction
     # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE B – LightGBM Training (Flat 6-Class, 100+ Tabular Features)")
+    logger.log(f"  PHASE B – Post-Normalisation Tabular Feature Extraction "
+               f"({N_TAB_FEATURES} features per sample)")
     logger.log("═" * 70)
 
     t_phaseB_start = time.time()
-    gbdt_fold_results = []
-    gbdt_all_preds    = []
-    gbdt_all_labels   = []
 
-    for fold_idx in folds_to_run:
-        gbdt_val_f1, gbdt_model, oof_probs_g, oof_labels_g = train_fold_gbdt(
-            fold_idx, CFG, logger)
+    # all_signals is (N_train, 300, 8) → normalise → transpose to (N, 8, 300) for extractor
+    logger.log("  Normalising full training set for feature extraction ...")
+    all_signals_norm    = normalize(all_signals, global_mean, global_std)  # (N, 300, 8)
+    all_signals_norm_CL = all_signals_norm.transpose(0, 2, 1).astype(np.float32)  # (N, 8, 300)
 
-        gbdt_fold_results.append(
-            (fold_idx, gbdt_val_f1, gbdt_model, oof_probs_g, oof_labels_g))
+    logger.log(f"  Extracting tabular features from training set "
+               f"(shape: {all_signals_norm_CL.shape}) ...")
+    t_feat_tr = time.time()
+    tab_feats_train = extract_tabular_features(all_signals_norm_CL)   # (N_train, 136)
+    logger.log(f"  Train tabular features extracted: {tab_feats_train.shape}  "
+               f"({time.time() - t_feat_tr:.1f}s)")
 
-        if oof_probs_g is not None and len(oof_probs_g) > 0:
-            oof_probs_gbdt_list.append(oof_probs_g)
-            gbdt_all_preds.extend(oof_probs_g.argmax(axis=1).tolist())
-            gbdt_all_labels.extend(oof_labels_g.tolist())
+    # Test: normed_test_signals is (N_test, 300, 8) → transpose to (N, 8, 300)
+    normed_test_CL_for_feat = normed_test_signals.transpose(0, 2, 1).astype(np.float32)
+    logger.log(f"  Extracting tabular features from test set "
+               f"(shape: {normed_test_CL_for_feat.shape}) ...")
+    t_feat_te = time.time()
+    tab_feats_test  = extract_tabular_features(normed_test_CL_for_feat)   # (N_test, 136)
+    logger.log(f"  Test  tabular features extracted: {tab_feats_test.shape}  "
+               f"({time.time() - t_feat_te:.1f}s)")
 
     t_phaseB = time.time() - t_phaseB_start
+    logger.log(f"  Phase B wall-clock: {t_phaseB:.1f}s")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE C – Build 142-dim Meta-Feature Matrices & Train LightGBM
+    # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE B SUMMARY – LightGBM Cross-Validation")
+    logger.log(f"  PHASE C – Stacking Meta-Feature Construction "
+               f"(CNN probs {NUM_CLASSES} + tabular {N_TAB_FEATURES} = {N_META_FEATURES})")
     logger.log("═" * 70)
-    gbdt_f1_scores = [r[1] for r in gbdt_fold_results]
-    for fi, bf1, _, _, _ in gbdt_fold_results:
-        logger.log(f"  [GBDT] Fold {fi+1}:  Val Macro F1 = {bf1:.6f}")
-    if len(gbdt_f1_scores) > 0:
-        logger.log(f"\n  [GBDT] Mean F1 = {np.mean(gbdt_f1_scores):.6f}  "
-                   f"±  {np.std(gbdt_f1_scores):.6f}")
-    logger.log(f"  Phase B wall-clock: {t_phaseB / 60:.1f} min")
-    logger.log(f"  Total A+B wall-clock: {(t_phaseA + t_phaseB) / 60:.1f} min")
 
-    if len(gbdt_all_labels) > 0:
-        cm_text_g = format_confusion_matrix(
-            gbdt_all_labels, gbdt_all_preds, CLASS_NAMES)
-        logger.log_file("\n--- [GBDT] Aggregate Confusion Matrix ---")
-        logger.log_file(cm_text_g)
-        logger.log("\n--- [GBDT] Aggregate Confusion Matrix ---")
-        logger.log(cm_text_g)
+    # For training: use only the OOF-covered samples (all samples when all folds run)
+    train_mask = oof_idx_covered   # boolean (N_train,)
+    n_meta_train = train_mask.sum()
 
-    # ════════════════════════════════════════════════════════════════════════
-    # OOF BLENDING WEIGHT OPTIMIZATION
-    # ════════════════════════════════════════════════════════════════════════
-    blend_weights = np.full(NUM_CLASSES, 0.5, dtype=np.float64)  # default fallback
+    if n_meta_train == 0:
+        logger.log("  ERROR: No OOF-covered samples found. "
+                   "Run with --all-folds for a proper stacking pipeline.")
+        logger.close()
+        return
 
-    if (len(oof_probs_dl_list) > 0 and len(oof_probs_gbdt_list) > 0 and
-            len(oof_labels_list) > 0):
+    # Concatenate: (N_covered, 6) CNN probs + (N_covered, 136) tabular = (N_covered, 142)
+    meta_X_train = np.concatenate([
+        oof_cnn_probs_full[train_mask],   # (N, 6)
+        tab_feats_train[train_mask],       # (N, 136)
+    ], axis=1).astype(np.float32)          # (N, 142)
 
-        # Concatenate OOF matrices from all folds
-        oof_dl_all   = np.concatenate(oof_probs_dl_list,   axis=0)  # (N_total, 6)
-        oof_gbdt_all = np.concatenate(oof_probs_gbdt_list, axis=0)  # (N_total, 6)
-        oof_lbl_all  = np.concatenate(oof_labels_list,     axis=0)  # (N_total,)
+    meta_y_train = all_labels[train_mask]  # (N,)
+    meta_groups_train = all_groups[train_mask]  # (N,) – for meta-fold splits
 
-        # Verify alignment: DL and GBDT OOF may differ in size if folds differ
-        # Use minimum size for safe alignment
-        n_min = min(len(oof_dl_all), len(oof_gbdt_all), len(oof_lbl_all))
-        if n_min < len(oof_lbl_all):
-            logger.log(f"  NOTE: Aligning OOF sizes: DL={len(oof_dl_all)}  "
-                       f"GBDT={len(oof_gbdt_all)}  Using N={n_min}")
-        oof_dl_all   = oof_dl_all[:n_min]
-        oof_gbdt_all = oof_gbdt_all[:n_min]
-        oof_lbl_all  = oof_lbl_all[:n_min]
+    # Test: (N_test, 6) CNN avg probs + (N_test, 136) tabular = (N_test, 142)
+    meta_X_test = np.concatenate([
+        cnn_test_probs,   # (N_test, 6)
+        tab_feats_test,   # (N_test, 136)
+    ], axis=1).astype(np.float32)
 
-        blend_weights = optimize_blend_weights(
-            oof_dl_all, oof_gbdt_all, oof_lbl_all, logger)
-    else:
-        logger.log("\n  WARNING: Insufficient OOF data for weight optimization. "
-                   "Using equal blend W=[0.5, ...].")
-
-    # Log final blend weights
-    logger.log("\n" + "─" * 70)
-    logger.log("  Final Blend Weight Vector W (used for test inference):")
+    logger.log(f"  Meta-train matrix: {meta_X_train.shape}  ({n_meta_train} samples)")
+    logger.log(f"  Meta-test  matrix: {meta_X_test.shape}")
+    logger.log(f"  Meta-label distribution:")
     for c in range(NUM_CLASSES):
-        logger.log(f"    w_{c} ({CLASS_NAMES[c]}): {blend_weights[c]:.6f}")
-    logger.log("─" * 70)
+        cnt = int((meta_y_train == c).sum())
+        logger.log(f"    {CLASS_NAMES[c]}: {cnt:>5d}  "
+                   f"({cnt / max(len(meta_y_train), 1) * 100:.1f}%)")
+
+    t_phaseC_start = time.time()
+    test_preds_final = train_meta_lgbm(
+        meta_X_train         = meta_X_train,
+        meta_y_train         = meta_y_train,
+        meta_X_test          = meta_X_test,
+        all_signals_train_norm_CL = all_signals_norm_CL[train_mask],
+        all_labels           = meta_y_train,
+        folds_to_run         = folds_to_run,
+        all_groups           = meta_groups_train,
+        cfg                  = CFG,
+        logger               = logger,
+    )
+    t_phaseC = time.time() - t_phaseC_start
+    logger.log(f"\n  Phase C wall-clock: {t_phaseC / 60:.1f} min")
 
     # ════════════════════════════════════════════════════════════════════════
-    # INFERENCE – Flat Blending with TTFN
+    # SUBMISSION ASSEMBLY
     # ════════════════════════════════════════════════════════════════════════
-    if len(dl_fold_results) > 0:
-        submission = flat_ensemble_inference(
-            dl_fold_results   = dl_fold_results,
-            gbdt_fold_results = gbdt_fold_results,
-            blend_weights     = blend_weights,
-            cfg               = CFG,
-            device            = device,
-            logger            = logger,
-        )
+    logger.log("\n" + "═" * 70)
+    logger.log("  SUBMISSION ASSEMBLY")
+    logger.log("═" * 70)
 
+    submission = (
+        pd.DataFrame({"Id": test_file_ids, "Label": test_preds_final})
+        .sort_values("Id")
+        .reset_index(drop=True)
+    )
+    submission.to_csv(CFG["submission_path"], index=False)
+
+    logger.log(f"  Total test samples    : {n_test}")
+    logger.log(f"  Submission saved to   : {CFG['submission_path']}")
+    pred_dist = submission["Label"].value_counts().sort_index()
+    logger.log("  Final predicted label distribution:")
+    for lbl, cnt in pred_dist.items():
+        lbl_name = CLASS_NAMES[int(lbl)] if int(lbl) < len(CLASS_NAMES) else str(lbl)
+        logger.log(f"    {lbl_name} (Label {lbl}): {cnt:>5d}  "
+                   f"({cnt / n_test * 100:.1f}%)")
+
+    total_time = t_phaseA + t_phaseB + t_phaseC
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v10 (SE-InceptionTime + LightGBM + OOF Blend + TTFN) complete.")
-    logger.log(f"  Blend weight vector W: {np.round(blend_weights, 4).tolist()}")
+    logger.log("  Pipeline v11 (SE-InceptionTime OOF Stacking + LightGBM Meta-Learner) complete.")
+    logger.log(f"  Phase A (CNN Training):          {t_phaseA / 60:.1f} min")
+    logger.log(f"  Phase B (Feature Extraction):    {t_phaseB:.1f}s")
+    logger.log(f"  Phase C (Meta-Learner Training): {t_phaseC / 60:.1f} min")
+    logger.log(f"  Total wall-clock:                {total_time / 60:.1f} min")
     logger.log(f"  Submission: {CFG['submission_path']}")
     logger.log("=" * 70)
 
