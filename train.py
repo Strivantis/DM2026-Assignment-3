@@ -1,7 +1,7 @@
 """
 train.py
 --------
-HAR Flat 6-Class OOF Stacking & LightGBM Meta-Learner Pipeline (v12).
+HAR Flat 6-Class OOF Stacking & LightGBM Meta-Learner Pipeline (v13).
 
 Architecture
 ────────────
@@ -30,25 +30,33 @@ Training Phases
     • Features: 17 per channel × 8 channels = 136
     • v12 changes: FFT features REMOVED; Jerk statistics + Rolling Variation CV INJECTED
 
-  Phase C – LightGBM Stacked Meta-Learner (v12 Upgrade):
+  Phase C – LightGBM Stacked Meta-Learner (v13 Upgrade):
     • Concatenate CNN OOF probs (N, 6) + tabular features (N, 136) → (N, 142)
     • Train 5-fold 6-class LightGBM classifier over the 142-dimensional meta-space
-    • Custom Multi-Class Focal Loss (γ=2.0) replaces default multiclass objective
-    • colsample_bytree=0.6 feature fraction defence prevents CNN prob saturation
-    • Clean argmax over meta-learner output → submission_v12_stacking.csv
+    • Native multiclass objective (objective='multiclass') – stable cross-entropy
+    • Optuna Bayesian Optimization: 25 trials per fold to discover optimal
+      hyperparameters and Dynamic Label 2 Weight Multiplier (M_L2 ∈ [1.0, 5.0])
+    • Baseline class weights from sklearn compute_class_weight('balanced')
+    • Early abort safeguard: if Fold 1 Val Macro F1 < 0.3 → sys.exit()
+    • Clean argmax over meta-learner output → submission_v13_stacking.csv
 
-    REMOVED from v11 (v12 decommissions):
-      ✗ Test-Time Feature Normalization (TTFN) – completely removed
-      ✗ Manual probability blending (0.5×CNN + 0.5×GBDT)
-      ✗ OOF blending weight optimization (scipy L-BFGS-B)
-      ✗ Default objective='multiclass' + class_weight='balanced' (replaced by focal loss)
-      ✗ FFT frequency-domain features (fft_dc, fft_max_amp, fft_energy) per channel
+    REMOVED from v12 (v13 decommissions):
+      ✗ Custom LightGBM Multi-Class Focal Loss objective (γ=2.0)
+      ✗ _focal_multiclass_objective / _focal_multiclass_eval custom gradients
+      ✗ SMOTE over-sampling (was never applied but fully purged)
 
-    ADDED in v12:
-      ✓ Custom LightGBM Multi-Class Focal Loss objective (γ=2.0)
-      ✓ Jerk statistics: mean & std of d²X/dt² (2nd temporal derivative)
+    ADDED in v13:
+      ✓ Native objective='multiclass' (stable cross-entropy)
+      ✓ sklearn compute_class_weight('balanced') baseline weight matrix
+      ✓ Optuna Bayesian search: M_L2, max_depth, colsample_bytree, reg_lambda
+      ✓ 25 Optuna trials per fold optimising Validation Macro F1
+      ✓ Early abort safeguard on Fold 1 (F1 < 0.3 → sys.exit)
+      ✓ Preserved: jerk_mean, jerk_std, rolling_var_cv from v12
+
+    RETAINED from v12:
+      ✓ Jerk statistics: mean & std of d²X/dt²
       ✓ Rolling variance Coefficient of Variation (CV = std/mean over 50-step windows)
-      ✓ Feature fraction defense: colsample_bytree=0.6
+      ✓ Feature fraction defense via colsample_bytree (Optuna-tuned)
 
 Usage
 ─────
@@ -76,6 +84,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     f1_score, accuracy_score, classification_report, confusion_matrix
 )
+from sklearn.utils.class_weight import compute_class_weight
 
 try:
     import lightgbm as lgb
@@ -86,6 +95,17 @@ except ImportError:
 if not LGBM_AVAILABLE:
     raise ImportError(
         "LightGBM is not installed. Please install: pip install lightgbm")
+
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+if not OPTUNA_AVAILABLE:
+    raise ImportError(
+        "Optuna is not installed. Please install: pip install optuna")
 
 from dataset import (
     load_all_samples, load_test_samples, get_fold_splits,
@@ -125,7 +145,7 @@ CFG = {
     # Paths ───────────────────────────────────────────────────────────────────
     "train_root"        : "./train/train",
     "test_root"         : "./test/test",
-    "submission_path"   : "./submission_v12_stacking.csv",
+    "submission_path"   : "./submission_v13_stacking.csv",
     "checkpoint_dir"    : "./checkpoints",
     "log_path"          : "./training_log.txt",
 
@@ -162,10 +182,13 @@ CFG = {
     "mixup_alpha"       : 0.2,
 
     # Cross-validation ────────────────────────────────────────────────────────
-    "run_all_folds"     : True,    # v12 default: always run all 5 folds
+    "run_all_folds"     : True,    # v13 default: always run all 5 folds
 
     # Reproducibility ─────────────────────────────────────────────────────────
     "seed"              : 42,
+
+    # Optuna configuration ────────────────────────────────────────────────────
+    "optuna_n_trials"   : 25,      # search budget per fold
 }
 
 
@@ -445,137 +468,96 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
     return np.stack(feature_rows, axis=0)   # (N, 136)
 
 
-N_TAB_FEATURES = 136   # 17 features × 8 ch  (v12: 10 stat + 4 deriv + 2 jerk + 1 rv_cv)
+N_TAB_FEATURES  = 136   # 17 features × 8 ch  (v12: 10 stat + 4 deriv + 2 jerk + 1 rv_cv)
 N_META_FEATURES = N_TAB_FEATURES + NUM_CLASSES   # 136 + 6 = 142
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Module 5: LightGBM Meta-Learner v12 (Custom Focal Loss + Feature Fraction)
+# Module 5: LightGBM Meta-Learner v13 (Native Multiclass + Optuna Tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Custom Multi-Class Focal Loss for LightGBM ────────────────────────────────
-# LightGBM custom objective receives raw leaf scores (logits) and must return
-# (gradient, hessian) arrays of shape (N * num_class,) in row-major order
-# [sample_0_class_0, sample_0_class_1, ..., sample_N_class_K].
-#
-# Focal Loss reduction for class k at sample i:
-#   p_k   = softmax(z)_k
-#   FL_k  = -(1 - p_true)^γ * log(p_true)      [for the true class]
-#
-# Compact gradient derivation (Lin et al. 2017 adapted to multi-class softmax):
-#   ∂FL/∂z_k = focal_w * (p_k - 1_{y=k})
-#             + γ * focal_w * log(p_true) * (p_k - 1_{y=k})  [correction term]
-# where focal_w = (1 - p_true)^γ
-# ─────────────────────────────────────────────────────────────────────────────
-
-_LGBM_FOCAL_GAMMA: float = 2.0   # γ – focusing parameter
-
-
-def _focal_multiclass_objective(
-        y_true: np.ndarray,
-        y_pred: np.ndarray) -> tuple:
+def _build_class_weights_v13(y_train: np.ndarray, m_l2: float) -> dict:
     """
-    Custom multi-class Focal Loss objective for LightGBM (sklearn API).
+    Build the per-class sample-weight vector for LightGBM (sample_weight parameter).
 
-    LightGBM's sklearn wrapper calls the custom objective as:
-        grad, hess = func(y_true, y_pred)
-    where y_true is a numpy array of integer labels (NOT a lgb.Dataset).
+    Steps
+    ─────
+    1. Compute balanced baseline weights via sklearn compute_class_weight('balanced').
+    2. Scale Label 2's weight by dynamic multiplier M_L2 ∈ [1.0, 5.0].
+    3. Return a per-sample weight array aligned with y_train.
 
     Parameters
     ----------
-    y_true : np.ndarray, shape (N,)       – integer class labels 0..K-1
-    y_pred : np.ndarray, shape (N * K,)   – raw leaf scores, row-major order
+    y_train : np.ndarray (N,)  – integer class labels for training fold
+    m_l2    : float            – Label 2 dynamic weight multiplier
 
     Returns
     -------
-    grad : np.ndarray, shape (N * K,)
-    hess : np.ndarray, shape (N * K,)
+    sample_weights : np.ndarray (N,) – per-sample fit weight
     """
-    gamma  = _LGBM_FOCAL_GAMMA
-    y_true = y_true.astype(np.int32)
-    N      = len(y_true)
-    K      = NUM_CLASSES
+    classes = np.arange(NUM_CLASSES)
+    base_weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_train,
+    )  # shape (NUM_CLASSES,), one weight per class
 
-    # Reshape to (N, K) and compute numerically stable softmax
-    scores = y_pred.reshape(N, K)
-    scores = scores - scores.max(axis=1, keepdims=True)
-    exp_s  = np.exp(scores)
-    prob   = exp_s / exp_s.sum(axis=1, keepdims=True)          # (N, K)
+    # Apply dynamic Label 2 multiplier
+    base_weights[2] *= m_l2
 
-    # One-hot encoding of ground-truth labels
-    one_hot = np.zeros((N, K), dtype=np.float64)
-    one_hot[np.arange(N), y_true] = 1.0
-
-    # True-class probability and focal weight per sample
-    p_true  = prob[np.arange(N), y_true]                       # (N,)
-    focal_w = (1.0 - p_true) ** gamma                          # (N,)
-    log_pt  = np.log(p_true + 1e-9)                            # (N,)
-
-    # ── Gradient: focal-weighted CE gradient + γ-correction term ──────────────
-    # Shape (N, K): for each class k, residual = (p_k - 1_{y=k})
-    residual = prob - one_hot                                   # (N, K)
-    grad = (
-        focal_w[:, None] * residual
-        + gamma * focal_w[:, None] * log_pt[:, None] * residual
-    )
-
-    # ── Hessian: diagonal approximation, re-weighted CE hessian ─────────────
-    hess = np.maximum(focal_w[:, None] * prob * (1.0 - prob), 1e-6)
-
-    return grad.flatten().astype(np.float64), hess.flatten().astype(np.float64)
+    # Build per-sample weight array
+    sample_weights = base_weights[y_train]
+    return sample_weights
 
 
-def _focal_multiclass_eval(
-        y_true: np.ndarray,
-        y_pred: np.ndarray) -> tuple:
+def _optuna_objective_factory(X_tr, y_tr, X_vl, y_vl, seed: int):
     """
-    Custom Focal Loss evaluation metric (sklearn API).
-    Returns ('focal_loss', value, is_higher_better=False).
+    Returns a closure that Optuna calls for each trial.
+
+    Search space
+    ────────────
+    • m_l2            : float ∈ [1.0, 5.0]   – Label 2 weight multiplier
+    • max_depth        : int  ∈ [3, 7]
+    • colsample_bytree : float ∈ [0.4, 0.8]
+    • reg_lambda       : float ∈ [1e-3, 10.0] (log-uniform)
+
+    Objective
+    ─────────
+    Maximise validation Macro F1-Score.
     """
-    gamma  = _LGBM_FOCAL_GAMMA
-    y_true = y_true.astype(np.int32)
-    N      = len(y_true)
-    K      = NUM_CLASSES
+    def objective(trial: optuna.Trial) -> float:
+        m_l2            = trial.suggest_float("m_l2", 1.0, 5.0)
+        max_depth       = trial.suggest_int("max_depth", 3, 7)
+        colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
+        reg_lambda      = trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True)
 
-    scores = y_pred.reshape(N, K)
-    scores = scores - scores.max(axis=1, keepdims=True)
-    exp_s  = np.exp(scores)
-    prob   = exp_s / exp_s.sum(axis=1, keepdims=True)
+        sample_weights  = _build_class_weights_v13(y_tr, m_l2)
 
-    p_true  = prob[np.arange(N), y_true]
-    focal_w = (1.0 - p_true) ** gamma
-    loss    = float(np.mean(-focal_w * np.log(p_true + 1e-9)))
-    return "focal_loss", loss, False
+        model = lgb.LGBMClassifier(
+            objective        = "multiclass",
+            num_class        = NUM_CLASSES,
+            n_estimators     = 1000,
+            learning_rate    = 0.05,
+            max_depth        = max_depth,
+            num_leaves       = min(2 ** max_depth - 1, 63),
+            min_child_samples= 20,
+            subsample        = 0.8,
+            subsample_freq   = 1,
+            colsample_bytree = colsample_bytree,
+            reg_alpha        = 0.1,
+            reg_lambda       = reg_lambda,
+            random_state     = seed,
+            verbose          = -1,
+            n_jobs           = -1,
+        )
 
+        model.fit(X_tr, y_tr, sample_weight=sample_weights)
+        vl_probs = model.predict_proba(X_vl)
+        vl_preds = vl_probs.argmax(axis=1)
+        macro_f1 = f1_score(y_vl, vl_preds, average="macro", zero_division=0)
+        return macro_f1
 
-def build_meta_lgbm_model() -> lgb.LGBMClassifier:
-    """
-    Instantiate a 6-class LightGBM meta-learner for the stacking layer (v12).
-
-    v12 upgrades vs v11:
-    ──────────────────────────────────────────────────────────────────
-    • objective     : custom focal loss (γ=2.0)  ← replaces 'multiclass'
-    • class_weight  : REMOVED (focal loss handles imbalance natively)
-    • colsample_bytree : 0.6  ← feature fraction defense (was 0.8)
-    """
-    return lgb.LGBMClassifier(
-        objective        = _focal_multiclass_objective,
-        num_class        = NUM_CLASSES,
-        n_estimators     = 1000,
-        learning_rate    = 0.05,
-        max_depth        = 7,
-        num_leaves       = 63,
-        min_child_samples= 20,
-        subsample        = 0.8,
-        subsample_freq   = 1,
-        colsample_bytree = 0.6,   # v12: feature fraction defense (was 0.8)
-        reg_alpha        = 0.1,
-        reg_lambda       = 1.0,
-        # class_weight removed – focal loss targets imbalance directly
-        random_state     = 42,
-        verbose          = -1,
-        n_jobs           = -1,
-    )
+    return objective
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -907,7 +889,7 @@ def accumulate_test_cnn_probs(dl_fold_results: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase C: LightGBM Meta-Learner Stacking
+# Phase C: LightGBM Meta-Learner Stacking (v13 – Optuna Tuning)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_meta_lgbm(meta_X_train: np.ndarray,
@@ -922,6 +904,17 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
     """
     Train a 5-fold LightGBM meta-learner on the 142-dimensional stacked meta-space.
 
+    v13 changes
+    ───────────
+    • Native objective='multiclass' (stable cross-entropy, no custom gradients)
+    • Per-fold Optuna Bayesian search (25 trials) over:
+        – m_l2            ∈ [1.0, 5.0]     (Label 2 dynamic weight multiplier)
+        – max_depth       ∈ [3, 7]
+        – colsample_bytree ∈ [0.4, 0.8]
+        – reg_lambda      ∈ [1e-3, 10.0] log-uniform
+    • compute_class_weight('balanced') baseline + M_L2 boost for Label 2
+    • Early abort safeguard: if Fold 1 Val Macro F1 < 0.3 → sys.exit()
+
     Parameters
     ----------
     meta_X_train : (N_train, 142) – CNN OOF probs (6) + tabular features (136)
@@ -931,7 +924,7 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
     all_labels   : (N_train,)     – aligned labels (same ordering as meta_X_train)
     folds_to_run : list of fold indices
     all_groups   : (N_train,)     – user group IDs (no test set contamination)
-    cfg          : dict
+    cfg          : dict           – pipeline config (must contain 'optuna_n_trials', 'seed')
     logger       : DualLogger
 
     Returns
@@ -939,26 +932,35 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
     test_preds_final : np.ndarray (N_test,) – argmax predictions
     """
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE C – LightGBM Meta-Learner Stacking (142-dim)")
+    logger.log("  PHASE C – LightGBM Meta-Learner Stacking v13 (Optuna Tuning, 142-dim)")
     logger.log("═" * 70)
     logger.log(f"  Meta-feature matrix shape: train={meta_X_train.shape}  "
                f"test={meta_X_test.shape}")
     logger.log(f"  Feature breakdown: {NUM_CLASSES} CNN OOF probs + "
                f"{N_TAB_FEATURES} tabular = {N_META_FEATURES} total")
 
+    n_trials = cfg.get("optuna_n_trials", 25)
+    seed     = cfg.get("seed", 42)
+
+    logger.log(f"  Optuna budget      : {n_trials} trials per fold")
+    logger.log(f"  Objective          : native multiclass (cross-entropy)")
+    logger.log(f"  Class-weight base  : sklearn compute_class_weight('balanced')")
+    logger.log(f"  M_L2 search range  : [1.0, 5.0]")
+
     from sklearn.model_selection import StratifiedGroupKFold
-    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    sgkf   = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
     splits = list(sgkf.split(meta_X_train, meta_y_train, groups=all_groups))
 
     meta_oof_preds  = np.zeros(len(meta_y_train), dtype=np.int64)
     meta_test_probs = np.zeros((meta_X_test.shape[0], NUM_CLASSES), dtype=np.float64)
     meta_f1_scores  = []
     meta_models     = []
+    best_params_per_fold = []
 
     folds_iter = folds_to_run if folds_to_run else list(range(N_FOLDS))
 
-    for fold_idx in folds_iter:
-        fold_num = fold_idx + 1
+    for loop_pos, fold_idx in enumerate(folds_iter):
+        fold_num       = fold_idx + 1
         tr_idx, vl_idx = splits[fold_idx]
 
         X_tr = meta_X_train[tr_idx]
@@ -966,19 +968,72 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
         X_vl = meta_X_train[vl_idx]
         y_vl = meta_y_train[vl_idx]
 
-        logger.log(f"\n  [Meta-LGB] Fold {fold_num}/{N_FOLDS}  "
+        logger.log(f"\n  [Meta-LGB|v13] Fold {fold_num}/{N_FOLDS}  "
                    f"train={len(tr_idx)}  val={len(vl_idx)}")
+        logger.log(f"  [Meta-LGB|v13] Launching Optuna study ({n_trials} trials) ...")
 
-        meta_model = build_meta_lgbm_model()
+        # ── Optuna study ──────────────────────────────────────────────────────
+        sampler = optuna.samplers.TPESampler(seed=seed + fold_idx)
+        study   = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+            study_name=f"meta_lgbm_fold{fold_num}",
+        )
+
+        objective_fn = _optuna_objective_factory(X_tr, y_tr, X_vl, y_vl, seed)
+        study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=False)
+
+        best_trial  = study.best_trial
+        best_params = best_trial.params
+        best_f1_opt = best_trial.value
+
+        logger.log(f"  [Meta-LGB|v13|Fold {fold_num}] Optuna best Val F1: {best_f1_opt:.6f}")
+        logger.log(f"  [Meta-LGB|v13|Fold {fold_num}] Best hyperparameters:")
+        for k, v in best_params.items():
+            logger.log(f"      {k:<22}: {v}")
+        best_params_per_fold.append({"fold": fold_num, "val_f1": best_f1_opt,
+                                     **best_params})
+        logger.log_file(f"\n  [Meta-LGB|v13|Fold {fold_num}] All {n_trials} trials:")
+        for t in sorted(study.trials, key=lambda t: t.value, reverse=True):
+            logger.log_file(
+                f"    trial {t.number:>3}  F1={t.value:.6f}  "
+                + "  ".join(f"{k}={v:.4g}" for k, v in t.params.items())
+            )
+
+        # ── Retrain final model on full fold using best params ─────────────────
+        m_l2            = best_params["m_l2"]
+        max_depth       = best_params["max_depth"]
+        colsample_bytree = best_params["colsample_bytree"]
+        reg_lambda      = best_params["reg_lambda"]
+
+        sample_weights_final = _build_class_weights_v13(y_tr, m_l2)
+
+        meta_model = lgb.LGBMClassifier(
+            objective        = "multiclass",
+            num_class        = NUM_CLASSES,
+            n_estimators     = 1000,
+            learning_rate    = 0.05,
+            max_depth        = max_depth,
+            num_leaves       = min(2 ** max_depth - 1, 63),
+            min_child_samples= 20,
+            subsample        = 0.8,
+            subsample_freq   = 1,
+            colsample_bytree = colsample_bytree,
+            reg_alpha        = 0.1,
+            reg_lambda       = reg_lambda,
+            random_state     = seed,
+            verbose          = -1,
+            n_jobs           = -1,
+        )
 
         t_start = time.time()
-        meta_model.fit(X_tr, y_tr)
+        meta_model.fit(X_tr, y_tr, sample_weight=sample_weights_final)
         elapsed = time.time() - t_start
 
-        vl_probs  = meta_model.predict_proba(X_vl)     # (N_val, 6)
-        vl_preds  = vl_probs.argmax(axis=1)
-        fold_f1   = f1_score(y_vl, vl_preds, average="macro", zero_division=0)
-        fold_acc  = accuracy_score(y_vl, vl_preds) * 100.0
+        vl_probs = meta_model.predict_proba(X_vl)     # (N_val, 6)
+        vl_preds = vl_probs.argmax(axis=1)
+        fold_f1  = f1_score(y_vl, vl_preds, average="macro", zero_division=0)
+        fold_acc = accuracy_score(y_vl, vl_preds) * 100.0
 
         meta_oof_preds[vl_idx] = vl_preds
         meta_f1_scores.append(fold_f1)
@@ -987,19 +1042,18 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
         # Accumulate test predictions from this fold
         meta_test_probs += meta_model.predict_proba(meta_X_test)
 
-        logger.log(f"  [Meta-LGB|Fold {fold_num}] Val Macro F1: {fold_f1:.4f}  "
-                   f"Acc: {fold_acc:.2f}%  Train time: {elapsed:.1f}s")
-        logger.log_file(f"  [Meta-LGB|Fold {fold_num}] Val Macro F1: {fold_f1:.6f}  "
-                        f"Acc: {fold_acc:.4f}%  Train time: {elapsed:.2f}s")
-        logger.log_file(f"  [Meta-LGB|Fold {fold_num}] Classification Report:")
+        logger.log(f"  [Meta-LGB|v13|Fold {fold_num}] Final Val Macro F1 : {fold_f1:.4f}  "
+                   f"Acc: {fold_acc:.2f}%  Fit time: {elapsed:.1f}s")
+        logger.log_file(f"  [Meta-LGB|v13|Fold {fold_num}] Final Val Macro F1: {fold_f1:.6f}  "
+                        f"Acc: {fold_acc:.4f}%  Fit time: {elapsed:.2f}s")
+        logger.log_file(f"  [Meta-LGB|v13|Fold {fold_num}] Classification Report:")
         logger.log_file(classification_report(
             y_vl, vl_preds, target_names=CLASS_NAMES,
             digits=4, zero_division=0))
         logger.log_file("─" * 70)
 
-        # Feature importances for this fold
+        # ── Feature importances ───────────────────────────────────────────────
         fi = meta_model.feature_importances_
-        # Build feature names: cnn_prob_L0..L5 + tabular features
         feat_names = [f"cnn_prob_{CLASS_NAMES[c]}" for c in range(NUM_CLASSES)]
         feat_names += [f"tab_ch{ch}_{stat}" for ch in range(8)
                        for stat in ["mean","std","median","max","min","var",
@@ -1011,38 +1065,62 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
             f"    {rank+1:>2}. {nm:<38s} {imp:>8d}"
             for rank, (nm, imp) in enumerate(fi_pairs[:20])
         )
-        logger.log_file(f"\n  [Meta-LGB|Fold {fold_num}] Top-20 Feature Importances "
+        logger.log_file(f"\n  [Meta-LGB|v13|Fold {fold_num}] Top-20 Feature Importances "
                         f"(gain split):\n{top20_str}")
+
+        # ── Module 4: Early Abort Convergence Safeguard (Fold 1 only) ─────────
+        # Executed after the very first fold's validation sweep.
+        # If Val Macro F1 is below 0.3, the training state is catastrophically
+        # corrupted. Abort immediately to prevent wasted compute.
+        if loop_pos == 0:
+            if fold_f1 < 0.3:
+                msg = (
+                    f"\n[EARLY ABORT] FOLD 1 VAL MACRO F1 = {fold_f1:.4f} < 0.3  "
+                    f"– Catastrophic failure detected in meta-learner. "
+                    f"Aborting execution to prevent corrupted array propagation."
+                )
+                logger.log(msg)
+                logger.close()
+                sys.exit(1)
+            else:
+                logger.log(f"  [Early Abort Check – Fold 1 PASSED]  "
+                           f"Val F1 = {fold_f1:.4f} ≥ 0.3  → continuing.")
 
     # ── Phase C summary ───────────────────────────────────────────────────────
     logger.log("\n" + "═" * 70)
-    logger.log("  PHASE C SUMMARY – LightGBM Meta-Learner CV")
+    logger.log("  PHASE C SUMMARY – LightGBM Meta-Learner CV (v13 Optuna)")
     logger.log("═" * 70)
     for fi_idx, f1_val in enumerate(meta_f1_scores):
-        logger.log(f"  [Meta-LGB] Fold {folds_iter[fi_idx]+1}:  Val Macro F1 = {f1_val:.6f}")
-    logger.log(f"\n  [Meta-LGB] Mean F1 = {np.mean(meta_f1_scores):.6f}  "
+        fold_key = folds_iter[fi_idx] + 1
+        bp       = best_params_per_fold[fi_idx]
+        logger.log(
+            f"  [Meta-LGB|v13] Fold {fold_key}:  Val Macro F1 = {f1_val:.6f}  "
+            f"| m_l2={bp['m_l2']:.4f}  max_depth={bp['max_depth']}  "
+            f"colsample={bp['colsample_bytree']:.4f}  reg_lambda={bp['reg_lambda']:.4e}"
+        )
+    logger.log(f"\n  [Meta-LGB|v13] Mean F1 = {np.mean(meta_f1_scores):.6f}  "
                f"±  {np.std(meta_f1_scores):.6f}")
 
     # OOF F1 (full meta-OOF, only meaningful when all 5 folds are run)
     oof_f1 = f1_score(meta_y_train, meta_oof_preds, average="macro", zero_division=0)
-    logger.log(f"  [Meta-LGB] OOF Macro F1 (all folds combined): {oof_f1:.6f}")
+    logger.log(f"  [Meta-LGB|v13] OOF Macro F1 (all folds combined): {oof_f1:.6f}")
 
-    if len(meta_all_labels := meta_y_train) > 0:
+    if len(meta_y_train) > 0:
         cm_text = format_confusion_matrix(
             meta_y_train.tolist(), meta_oof_preds.tolist(), CLASS_NAMES)
-        logger.log_file("\n--- [Meta-LGB] OOF Confusion Matrix ---")
+        logger.log_file("\n--- [Meta-LGB|v13] OOF Confusion Matrix ---")
         logger.log_file(cm_text)
-        logger.log("\n--- [Meta-LGB] OOF Confusion Matrix ---")
+        logger.log("\n--- [Meta-LGB|v13] OOF Confusion Matrix ---")
         logger.log(cm_text)
 
     # ── Aggregate test predictions (mean over trained folds) ──────────────────
-    n_folds_used = max(len(folds_iter), 1)
+    n_folds_used     = max(len(folds_iter), 1)
     avg_test_meta_probs = meta_test_probs / n_folds_used   # (N_test, 6)
     test_preds_final    = avg_test_meta_probs.argmax(axis=1).astype(np.int64)
 
     # ── Log aggregate feature importances across all meta-folds ──────────────
     logger.log("\n")
-    logger.log("  [Meta-LGB] Aggregate Feature Importances (mean across folds):")
+    logger.log("  [Meta-LGB|v13] Aggregate Feature Importances (mean across folds):")
     feat_names_base = [f"cnn_prob_{CLASS_NAMES[c]}" for c in range(NUM_CLASSES)]
     feat_names_base += [f"tab_ch{ch}_{stat}" for ch in range(8)
                         for stat in ["mean","std","median","max","min","var",
@@ -1052,7 +1130,7 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
     fi_sum = np.zeros(N_META_FEATURES, dtype=np.float64)
     for mm in meta_models:
         fi_sum += mm.feature_importances_.astype(np.float64)
-    fi_mean   = fi_sum / max(len(meta_models), 1)
+    fi_mean      = fi_sum / max(len(meta_models), 1)
     fi_pairs_agg = sorted(zip(feat_names_base, fi_mean),
                           key=lambda x: x[1], reverse=True)
     logger.log(f"  {'Rank':<5} {'Feature Name':<42} {'Avg Importance':>14}")
@@ -1069,21 +1147,23 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HAR SE-InceptionTime v12 – OOF Stacking + LightGBM Focal Loss Meta-Learner")
+        description="HAR SE-InceptionTime v13 – OOF Stacking + LightGBM Optuna Meta-Learner")
     parser.add_argument("--fold-1-only", action="store_true",
                         help="Run fold 1 only (default: all 5 folds)")
-    parser.add_argument("--epochs",     type=int,   default=CFG["epochs"])
-    parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
-    parser.add_argument("--lr",         type=float, default=CFG["lr"])
-    parser.add_argument("--patience",   type=int,   default=CFG["patience"])
+    parser.add_argument("--epochs",       type=int,   default=CFG["epochs"])
+    parser.add_argument("--batch-size",   type=int,   default=CFG["batch_size"])
+    parser.add_argument("--lr",           type=float, default=CFG["lr"])
+    parser.add_argument("--patience",     type=int,   default=CFG["patience"])
+    parser.add_argument("--optuna-trials", type=int,  default=CFG["optuna_n_trials"])
     args = parser.parse_args()
 
-    CFG["run_all_folds"] = not args.fold_1_only   # default True; --fold-1-only overrides
-    CFG["epochs"]        = args.epochs
-    CFG["batch_size"]    = args.batch_size
-    CFG["lr"]            = args.lr
-    CFG["patience"]      = args.patience
-    CFG["T_max"]         = args.epochs
+    CFG["run_all_folds"]    = not args.fold_1_only
+    CFG["epochs"]           = args.epochs
+    CFG["batch_size"]       = args.batch_size
+    CFG["lr"]               = args.lr
+    CFG["patience"]         = args.patience
+    CFG["T_max"]            = args.epochs
+    CFG["optuna_n_trials"]  = args.optuna_trials
 
     seed_everything(CFG["seed"])
 
@@ -1094,8 +1174,8 @@ def main():
     hidden_dim = CFG["nb_filters"] * 4
     header_lines = [
         "=" * 70,
-        "  HAR SE-InceptionTime v12 – OOF Stacking + LightGBM Focal Loss Meta-Learner",
-        "  (TTFN REMOVED | Global Z-score Norm | 142-dim | FFT pruned | LGB Focal γ=2.0)",
+        "  HAR SE-InceptionTime v13 – OOF Stacking + LightGBM Optuna Meta-Learner",
+        "  (Native Multiclass | Optuna M_L2 Tuning | 142-dim | No SMOTE | No Custom Loss)",
         "=" * 70,
         f"  Log file      : {os.path.abspath(CFG['log_path'])}",
         f"  Device        : {device}",
@@ -1120,7 +1200,8 @@ def main():
         f"  Normalisation : GLOBAL training-set Z-score (NO per-test TTFN)",
         f"  Meta Features : {NUM_CLASSES} CNN OOF probs + {N_TAB_FEATURES} tabular "
         f"= {N_META_FEATURES} dims",
-        f"  Meta-Learner  : LightGBM 5-fold CV (n_estimators=1000, custom focal γ={_LGBM_FOCAL_GAMMA}, colsample=0.6)",
+        f"  Meta-Learner  : LightGBM 5-fold CV (native multiclass + Optuna {CFG['optuna_n_trials']} trials/fold)",
+        f"  Class Weights : sklearn balanced + dynamic M_L2 ∈ [1.0, 5.0] for Label 2",
         f"  Tabular feat  : 17 per ch × 8 (10stat+4deriv+2jerk+1rv_cv, FFT pruned)",
         f"  CNN TTA       : ×0.95 / ×1.00 / ×1.05 arithmetic mean",
         f"  Blend logic   : NONE (meta-learner argmax only, no manual weighting)",
@@ -1152,7 +1233,6 @@ def main():
     all_signals, all_labels, all_groups, all_file_ids = load_all_samples(CFG["train_root"])
 
     # Compute global Z-score statistics from the complete training set
-    # This is the SINGLE reference scaler applied to ALL splits (train/val/test)
     global_mean, global_std = compute_normalization_params(all_signals)
 
     logger.log(f"  Total training samples loaded: {len(all_signals)}")
@@ -1171,7 +1251,6 @@ def main():
     logger.log(f"\n  Test samples loaded: {n_test}  shape: {raw_test_signals.shape}")
 
     # Apply GLOBAL training-set normalisation to test signals
-    # raw_test_signals is (N, 300, 8), normalize returns (N, 300, 8)
     normed_test_signals = normalize(raw_test_signals, global_mean, global_std)
 
     # Transpose to (N, 8, 300) for CNN input format
@@ -1192,7 +1271,6 @@ def main():
     dl_fold_results = []
 
     # OOF probability matrix for the entire training set: (N_train, 6)
-    # Indexed by absolute position in all_signals
     oof_cnn_probs_full  = np.zeros((len(all_signals), NUM_CLASSES), dtype=np.float32)
     oof_idx_covered     = np.zeros(len(all_signals), dtype=bool)
 
@@ -1210,7 +1288,6 @@ def main():
         dl_fold_results.append(
             (fold_idx, best_f1, ckpt_path, report, oof_probs, oof_labels, val_idx))
 
-        # Fill OOF probability slots at the validation indices
         if oof_probs is not None and len(oof_probs) > 0:
             oof_cnn_probs_full[val_idx] = oof_probs
             oof_idx_covered[val_idx]    = True
@@ -1261,24 +1338,22 @@ def main():
 
     t_phaseB_start = time.time()
 
-    # all_signals is (N_train, 300, 8) → normalise → transpose to (N, 8, 300) for extractor
     logger.log("  Normalising full training set for feature extraction ...")
-    all_signals_norm    = normalize(all_signals, global_mean, global_std)  # (N, 300, 8)
-    all_signals_norm_CL = all_signals_norm.transpose(0, 2, 1).astype(np.float32)  # (N, 8, 300)
+    all_signals_norm    = normalize(all_signals, global_mean, global_std)
+    all_signals_norm_CL = all_signals_norm.transpose(0, 2, 1).astype(np.float32)
 
     logger.log(f"  Extracting tabular features from training set "
                f"(shape: {all_signals_norm_CL.shape}) ...")
     t_feat_tr = time.time()
-    tab_feats_train = extract_tabular_features(all_signals_norm_CL)   # (N_train, 136)
+    tab_feats_train = extract_tabular_features(all_signals_norm_CL)
     logger.log(f"  Train tabular features extracted: {tab_feats_train.shape}  "
                f"({time.time() - t_feat_tr:.1f}s)")
 
-    # Test: normed_test_signals is (N_test, 300, 8) → transpose to (N, 8, 300)
     normed_test_CL_for_feat = normed_test_signals.transpose(0, 2, 1).astype(np.float32)
     logger.log(f"  Extracting tabular features from test set "
                f"(shape: {normed_test_CL_for_feat.shape}) ...")
     t_feat_te = time.time()
-    tab_feats_test  = extract_tabular_features(normed_test_CL_for_feat)   # (N_test, 136)
+    tab_feats_test  = extract_tabular_features(normed_test_CL_for_feat)
     logger.log(f"  Test  tabular features extracted: {tab_feats_test.shape}  "
                f"({time.time() - t_feat_te:.1f}s)")
 
@@ -1286,15 +1361,14 @@ def main():
     logger.log(f"  Phase B wall-clock: {t_phaseB:.1f}s")
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE C – Build 142-dim Meta-Feature Matrices & Train LightGBM
+    # PHASE C – Build 142-dim Meta-Feature Matrices & Train LightGBM (Optuna)
     # ════════════════════════════════════════════════════════════════════════
     logger.log("\n" + "═" * 70)
     logger.log(f"  PHASE C – Stacking Meta-Feature Construction "
                f"(CNN probs {NUM_CLASSES} + tabular {N_TAB_FEATURES} = {N_META_FEATURES})")
     logger.log("═" * 70)
 
-    # For training: use only the OOF-covered samples (all samples when all folds run)
-    train_mask = oof_idx_covered   # boolean (N_train,)
+    train_mask   = oof_idx_covered
     n_meta_train = train_mask.sum()
 
     if n_meta_train == 0:
@@ -1303,19 +1377,17 @@ def main():
         logger.close()
         return
 
-    # Concatenate: (N_covered, 6) CNN probs + (N_covered, 136) tabular = (N_covered, 142)
     meta_X_train = np.concatenate([
-        oof_cnn_probs_full[train_mask],   # (N, 6)
-        tab_feats_train[train_mask],       # (N, 136)
-    ], axis=1).astype(np.float32)          # (N, 142)
+        oof_cnn_probs_full[train_mask],
+        tab_feats_train[train_mask],
+    ], axis=1).astype(np.float32)
 
-    meta_y_train = all_labels[train_mask]  # (N,)
-    meta_groups_train = all_groups[train_mask]  # (N,) – for meta-fold splits
+    meta_y_train      = all_labels[train_mask]
+    meta_groups_train = all_groups[train_mask]
 
-    # Test: (N_test, 6) CNN avg probs + (N_test, 136) tabular = (N_test, 142)
     meta_X_test = np.concatenate([
-        cnn_test_probs,   # (N_test, 6)
-        tab_feats_test,   # (N_test, 136)
+        cnn_test_probs,
+        tab_feats_test,
     ], axis=1).astype(np.float32)
 
     logger.log(f"  Meta-train matrix: {meta_X_train.shape}  ({n_meta_train} samples)")
@@ -1328,15 +1400,15 @@ def main():
 
     t_phaseC_start = time.time()
     test_preds_final = train_meta_lgbm(
-        meta_X_train         = meta_X_train,
-        meta_y_train         = meta_y_train,
-        meta_X_test          = meta_X_test,
+        meta_X_train              = meta_X_train,
+        meta_y_train              = meta_y_train,
+        meta_X_test               = meta_X_test,
         all_signals_train_norm_CL = all_signals_norm_CL[train_mask],
-        all_labels           = meta_y_train,
-        folds_to_run         = folds_to_run,
-        all_groups           = meta_groups_train,
-        cfg                  = CFG,
-        logger               = logger,
+        all_labels                = meta_y_train,
+        folds_to_run              = folds_to_run,
+        all_groups                = meta_groups_train,
+        cfg                       = CFG,
+        logger                    = logger,
     )
     t_phaseC = time.time() - t_phaseC_start
     logger.log(f"\n  Phase C wall-clock: {t_phaseC / 60:.1f} min")
@@ -1366,7 +1438,7 @@ def main():
 
     total_time = t_phaseA + t_phaseB + t_phaseC
     logger.log("\n" + "=" * 70)
-    logger.log("  Pipeline v12 (SE-InceptionTime OOF Stacking + LightGBM Focal Loss) complete.")
+    logger.log("  Pipeline v13 (SE-InceptionTime OOF Stacking + LightGBM Optuna) complete.")
     logger.log(f"  Phase A (CNN Training):          {t_phaseA / 60:.1f} min")
     logger.log(f"  Phase B (Feature Extraction):    {t_phaseB:.1f}s")
     logger.log(f"  Phase C (Meta-Learner Training): {t_phaseC / 60:.1f} min")
