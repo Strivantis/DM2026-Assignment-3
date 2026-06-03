@@ -6,3 +6,4 @@ train/*
 checkpoints/*
 __pycache__/
 *.pyc
+checkpoints/
