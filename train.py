@@ -19,7 +19,7 @@ Training Phases
     • Batch-level Mixup (Beta(α=0.2))
     • AdamW + CosineAnnealingLR
     • Early stop on validation Macro F1 (patience=25)
-    • Saves: checkpoints/v12_fold_{n}_best.pth
+    • Saves: checkpoints/v13_fold_{n}_best.pth
     • OOF Collection:
         – At best epoch of each fold, stores val Softmax probs → (N_train, 6) OOF matrix
         – For test set, runs all 5 fold weights × TTA(0.95, 1.00, 1.05) → (N_test, 6) mean
@@ -30,7 +30,7 @@ Training Phases
     • Features: 17 per channel × 8 channels = 136
     • v12 changes: FFT features REMOVED; Jerk statistics + Rolling Variation CV INJECTED
 
-  Phase C – LightGBM Stacked Meta-Learner (v13 Upgrade):
+  Phase C – LightGBM Stacked Meta-Learner:
     • Concatenate CNN OOF probs (N, 6) + tabular features (N, 136) → (N, 142)
     • Train 5-fold 6-class LightGBM classifier over the 142-dimensional meta-space
     • Native multiclass objective (objective='multiclass') – stable cross-entropy
@@ -39,24 +39,6 @@ Training Phases
     • Baseline class weights from sklearn compute_class_weight('balanced')
     • Early abort safeguard: if Fold 1 Val Macro F1 < 0.3 → sys.exit()
     • Clean argmax over meta-learner output → submission_v13_stacking.csv
-
-    REMOVED from v12 (v13 decommissions):
-      ✗ Custom LightGBM Multi-Class Focal Loss objective (γ=2.0)
-      ✗ _focal_multiclass_objective / _focal_multiclass_eval custom gradients
-      ✗ SMOTE over-sampling (was never applied but fully purged)
-
-    ADDED in v13:
-      ✓ Native objective='multiclass' (stable cross-entropy)
-      ✓ sklearn compute_class_weight('balanced') baseline weight matrix
-      ✓ Optuna Bayesian search: M_L2, max_depth, colsample_bytree, reg_lambda
-      ✓ 25 Optuna trials per fold optimising Validation Macro F1
-      ✓ Early abort safeguard on Fold 1 (F1 < 0.3 → sys.exit)
-      ✓ Preserved: jerk_mean, jerk_std, rolling_var_cv from v12
-
-    RETAINED from v12:
-      ✓ Jerk statistics: mean & std of d²X/dt²
-      ✓ Rolling variance Coefficient of Variation (CV = std/mean over 50-step windows)
-      ✓ Feature fraction defense via colsample_bytree (Optuna-tuned)
 
 Usage
 ─────
@@ -84,6 +66,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     f1_score, accuracy_score, classification_report, confusion_matrix
 )
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.utils.class_weight import compute_class_weight
 
 try:
@@ -363,8 +346,7 @@ def _rolling_variance_cv(signal_1d: np.ndarray, window: int = 50) -> float:
 
     Slides a window of `window` steps across the signal (stride=1), computes
     the variance at each position, then returns CV = std(vars) / |mean(vars)|.
-    Distinguishes irregular L2 stair-climbing (high CV) from uniform L1/L4
-    running cadences (low CV).  Returns 0.0 when mean ≈ 0.
+    Returns 0.0 when mean ≈ 0.
     """
     n = len(signal_1d)
     n_windows = max(n - window + 1, 1)
@@ -398,11 +380,7 @@ def extract_tabular_features(signals_np: np.ndarray) -> np.ndarray:
         jerk_std   – std of d²X/dt²,   quantifies jolt irregularity
 
     Rolling Variation Complexity (1 feature):
-        rolling_var_cv – CV of 50-step rolling variance (std/|mean|);
-                         high for irregular L2 stair motion, low for periodic L1/L4
-
-    v12 PRUNED (vs v11):
-        ✗ fft_dc_component, fft_max_amplitude, fft_spectral_energy  – all removed
+        rolling_var_cv – CV of 50-step rolling variance (std/|mean|)
 
     Total: 17 × 8 = 136 features per sample.
 
@@ -478,13 +456,8 @@ N_META_FEATURES = N_TAB_FEATURES + NUM_CLASSES   # 136 + 6 = 142
 
 def _build_class_weights_v13(y_train: np.ndarray, m_l2: float) -> dict:
     """
-    Build the per-class sample-weight vector for LightGBM (sample_weight parameter).
-
-    Steps
-    ─────
-    1. Compute balanced baseline weights via sklearn compute_class_weight('balanced').
-    2. Scale Label 2's weight by dynamic multiplier M_L2 ∈ [1.0, 5.0].
-    3. Return a per-sample weight array aligned with y_train.
+    Build the per-sample weight vector: balanced baseline weights with Label 2
+    boosted by dynamic multiplier m_l2.
 
     Parameters
     ----------
@@ -502,28 +475,15 @@ def _build_class_weights_v13(y_train: np.ndarray, m_l2: float) -> dict:
         y=y_train,
     )  # shape (NUM_CLASSES,), one weight per class
 
-    # Apply dynamic Label 2 multiplier
     base_weights[2] *= m_l2
 
-    # Build per-sample weight array
     sample_weights = base_weights[y_train]
     return sample_weights
 
 
 def _optuna_objective_factory(X_tr, y_tr, X_vl, y_vl, seed: int):
     """
-    Returns a closure that Optuna calls for each trial.
-
-    Search space
-    ────────────
-    • m_l2            : float ∈ [1.0, 5.0]   – Label 2 weight multiplier
-    • max_depth        : int  ∈ [3, 7]
-    • colsample_bytree : float ∈ [0.4, 0.8]
-    • reg_lambda       : float ∈ [1e-3, 10.0] (log-uniform)
-
-    Objective
-    ─────────
-    Maximise validation Macro F1-Score.
+    Returns a closure that Optuna calls for each trial, maximising validation Macro F1.
     """
     def objective(trial: optuna.Trial) -> float:
         m_l2            = trial.suggest_float("m_l2", 1.0, 5.0)
@@ -691,7 +651,6 @@ def train_fold_dl(fold_idx:    int,
     train_labels_fold = all_labels[train_idx]
     val_labels_fold   = all_labels[val_idx]
 
-    # Class counts for focal loss alpha (from this fold's training labels)
     class_counts = np.bincount(train_labels_fold, minlength=NUM_CLASSES)
 
     logger.log_file(f"  Training samples  : {len(train_idx)}")
@@ -744,7 +703,7 @@ def train_fold_dl(fold_idx:    int,
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
     ckpt_path  = os.path.join(cfg["checkpoint_dir"],
-                              f"v12_fold_{fold_num}_best.pth")
+                              f"v13_fold_{fold_num}_best.pth")
     early_stop = EarlyStopping(patience=cfg["patience"], checkpoint_path=ckpt_path)
 
     best_val_preds  = (None, None)
@@ -895,25 +854,12 @@ def accumulate_test_cnn_probs(dl_fold_results: list,
 def train_meta_lgbm(meta_X_train: np.ndarray,
                     meta_y_train: np.ndarray,
                     meta_X_test:  np.ndarray,
-                    all_signals_train_norm_CL: np.ndarray,
-                    all_labels:   np.ndarray,
                     folds_to_run: list,
                     all_groups:   np.ndarray,
                     cfg:          dict,
                     logger:       DualLogger) -> np.ndarray:
     """
     Train a 5-fold LightGBM meta-learner on the 142-dimensional stacked meta-space.
-
-    v13 changes
-    ───────────
-    • Native objective='multiclass' (stable cross-entropy, no custom gradients)
-    • Per-fold Optuna Bayesian search (25 trials) over:
-        – m_l2            ∈ [1.0, 5.0]     (Label 2 dynamic weight multiplier)
-        – max_depth       ∈ [3, 7]
-        – colsample_bytree ∈ [0.4, 0.8]
-        – reg_lambda      ∈ [1e-3, 10.0] log-uniform
-    • compute_class_weight('balanced') baseline + M_L2 boost for Label 2
-    • Early abort safeguard: if Fold 1 Val Macro F1 < 0.3 → sys.exit()
 
     Parameters
     ----------
@@ -947,7 +893,6 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
     logger.log(f"  Class-weight base  : sklearn compute_class_weight('balanced')")
     logger.log(f"  M_L2 search range  : [1.0, 5.0]")
 
-    from sklearn.model_selection import StratifiedGroupKFold
     sgkf   = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=seed)
     splits = list(sgkf.split(meta_X_train, meta_y_train, groups=all_groups))
 
@@ -1068,10 +1013,7 @@ def train_meta_lgbm(meta_X_train: np.ndarray,
         logger.log_file(f"\n  [Meta-LGB|v13|Fold {fold_num}] Top-20 Feature Importances "
                         f"(gain split):\n{top20_str}")
 
-        # ── Module 4: Early Abort Convergence Safeguard (Fold 1 only) ─────────
-        # Executed after the very first fold's validation sweep.
-        # If Val Macro F1 is below 0.3, the training state is catastrophically
-        # corrupted. Abort immediately to prevent wasted compute.
+        # Abort early if meta-learner is catastrophically broken (below random baseline).
         if loop_pos == 0:
             if fold_f1 < 0.3:
                 msg = (
@@ -1230,7 +1172,7 @@ def main():
     logger.log("═" * 70)
 
     t0_start = time.time()
-    all_signals, all_labels, all_groups, all_file_ids = load_all_samples(CFG["train_root"])
+    all_signals, all_labels, all_groups, _ = load_all_samples(CFG["train_root"])
 
     # Compute global Z-score statistics from the complete training set
     global_mean, global_std = compute_normalization_params(all_signals)
@@ -1400,12 +1342,10 @@ def main():
 
     t_phaseC_start = time.time()
     test_preds_final = train_meta_lgbm(
-        meta_X_train              = meta_X_train,
-        meta_y_train              = meta_y_train,
-        meta_X_test               = meta_X_test,
-        all_signals_train_norm_CL = all_signals_norm_CL[train_mask],
-        all_labels                = meta_y_train,
-        folds_to_run              = folds_to_run,
+        meta_X_train = meta_X_train,
+        meta_y_train = meta_y_train,
+        meta_X_test  = meta_X_test,
+        folds_to_run = folds_to_run,
         all_groups                = meta_groups_train,
         cfg                       = CFG,
         logger                    = logger,

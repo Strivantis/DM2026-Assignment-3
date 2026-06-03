@@ -572,5 +572,202 @@ def main():
     print("=" * 70)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Plot generation (uses pre-computed results — no re-run required)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Results from the completed ablation run (ablation_phase_c.md)
+PRECOMPUTED_RESULTS = {
+    "Config 1 – Base Only (No RV_CV, No Jerk)": {
+        "fold_macro_f1":  [0.7039, 0.7564, 0.6777, 0.7612, 0.7247],
+        "fold_l2_recall": [0.2469, 0.2836, 0.2763, 0.2881, 0.0933],
+        "mean_macro_f1":  0.7248, "std_macro_f1":  0.0316,
+        "mean_l2_recall": 0.2377, "std_l2_recall": 0.0736,
+        "oof_macro_f1":   0.7250, "oof_l2_recall": 0.2346,
+        "feature_dims": 118,
+    },
+    "Config 2 – Base + Rolling Var CV (No Jerk)": {
+        "fold_macro_f1":  [0.7094, 0.7583, 0.6873, 0.7538, 0.7333],
+        "fold_l2_recall": [0.1975, 0.3134, 0.2895, 0.2203, 0.1333],
+        "mean_macro_f1":  0.7284, "std_macro_f1":  0.0269,
+        "mean_l2_recall": 0.2308, "std_l2_recall": 0.0648,
+        "oof_macro_f1":   0.7298, "oof_l2_recall": 0.2291,
+        "feature_dims": 126,
+    },
+    "Config 3 – Base + Jerk (No RV_CV)": {
+        "fold_macro_f1":  [0.7182, 0.7638, 0.6865, 0.7636, 0.7306],
+        "fold_l2_recall": [0.2593, 0.3433, 0.1842, 0.3051, 0.1067],
+        "mean_macro_f1":  0.7325, "std_macro_f1":  0.0293,
+        "mean_l2_recall": 0.2397, "std_l2_recall": 0.0850,
+        "oof_macro_f1":   0.7337, "oof_l2_recall": 0.2346,
+        "feature_dims": 134,
+    },
+    "Config 4 – Full v13 (All 142 dims)": {
+        "fold_macro_f1":  [0.7147, 0.7712, 0.6820, 0.7663, 0.7416],
+        "fold_l2_recall": [0.2222, 0.3582, 0.1842, 0.2542, 0.1467],
+        "mean_macro_f1":  0.7351, "std_macro_f1":  0.0333,
+        "mean_l2_recall": 0.2331, "std_l2_recall": 0.0722,
+        "oof_macro_f1":   0.7361, "oof_l2_recall": 0.2291,
+        "feature_dims": 142,
+    },
+}
+
+SHORT_LABELS = [
+    "C1: Base Only\n(118 dims)",
+    "C2: Base+RV_CV\n(126 dims)",
+    "C3: Base+Jerk\n(134 dims)",
+    "C4: Full v13\n(142 dims)",
+]
+
+
+def generate_ablation_plots(results: dict = None, plots_dir: str = "plots") -> None:
+    """Generate ablation study charts and save to plots_dir."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import numpy as np
+    except ImportError:
+        print("[Plot] matplotlib not available — skipping plot generation.")
+        return
+
+    os.makedirs(plots_dir, exist_ok=True)
+    if results is None:
+        results = PRECOMPUTED_RESULTS
+
+    cfg_names = list(results.keys())
+    n_configs = len(cfg_names)
+    colors = ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4"]  # red→blue = worse→better
+
+    # ── Plot 1: Mean Macro F1 comparison bar chart ─────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    means  = [results[n]["mean_macro_f1"]  for n in cfg_names]
+    stds   = [results[n]["std_macro_f1"]   for n in cfg_names]
+    oof_f1 = [results[n]["oof_macro_f1"]   for n in cfg_names]
+
+    x = np.arange(n_configs)
+    bars = ax.bar(x, means, yerr=stds, capsize=6, color=colors, alpha=0.82,
+                  width=0.55, ecolor="black", error_kw={"lw": 1.5})
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(SHORT_LABELS, fontsize=10)
+    ax.set_ylabel("5-Fold Mean Macro F1", fontsize=11)
+    ax.set_title("Ablation Study — Phase C Feature Group Contributions\n"
+                 "(LightGBM Meta-Learner, 5-Fold CV, bars = mean ± std)", fontsize=12)
+
+    # Compute ylim so all error-bar tops + OOF labels fit inside the axes
+    top_needed = max(m + s for m, s in zip(means, stds)) + 0.016
+    ax.set_ylim(0.69, top_needed)
+
+    ax.axhline(y=means[-1], color="#1f77b4", linestyle="--", lw=1.2, alpha=0.5,
+               label=f"Full v13 mean ({means[-1]:.4f})")
+    ax.legend(fontsize=9)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+
+    # Annotate with OOF F1 — placed just above each error-bar cap (inside axes)
+    for xi, (bar, oof, s) in enumerate(zip(bars, oof_f1, stds)):
+        ax.text(xi, bar.get_height() + s + 0.003,
+                f"OOF={oof:.4f}", ha="center", va="bottom", fontsize=9,
+                fontweight="bold", color=colors[xi])
+
+    # Annotate delta vs Config 4 — placed inside bars to stay above ylim floor
+    baseline = means[-1]
+    for xi, m in enumerate(means[:-1]):
+        delta = m - baseline
+        ax.text(xi, 0.693, f"Δ={delta:+.4f}",
+                ha="center", va="bottom", fontsize=8.5, color="darkred")
+
+    fig.tight_layout()
+    path1 = os.path.join(plots_dir, "06_ablation_macro_f1_comparison.png")
+    fig.savefig(path1, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] Saved: {path1}")
+
+    # ── Plot 2: Per-fold F1 breakdown (grouped bars) ────────────────────────────
+    fig, ax = plt.subplots(figsize=(11, 5))
+    fold_labels = [f"Fold {i+1}" for i in range(5)]
+    n_folds     = 5
+    bar_w       = 0.18
+    offsets     = np.linspace(-(n_configs - 1) * bar_w / 2,
+                               (n_configs - 1) * bar_w / 2, n_configs)
+
+    for ci, (name, color, offset) in enumerate(zip(cfg_names, colors, offsets)):
+        fold_vals = results[name]["fold_macro_f1"]
+        ax.bar(np.arange(n_folds) + offset, fold_vals,
+               width=bar_w, color=color, alpha=0.80, label=SHORT_LABELS[ci].replace("\n", " "))
+
+    ax.set_xticks(np.arange(n_folds))
+    ax.set_xticklabels(fold_labels, fontsize=11)
+    ax.set_ylabel("Macro F1", fontsize=11)
+    ax.set_title("Per-Fold Macro F1 — Phase C Feature Group Ablation", fontsize=12)
+    ax.set_ylim(0.63, 0.80)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    path2 = os.path.join(plots_dir, "07_ablation_per_fold_f1.png")
+    fig.savefig(path2, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] Saved: {path2}")
+
+    # ── Plot 3: Marginal contribution waterfall ─────────────────────────────────
+    # Shows how each feature group additively improves over Config 1 baseline
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: cumulative OOF F1 as features are added
+    oof_vals = [results[n]["oof_macro_f1"] for n in cfg_names]
+    ax_l = axes[0]
+    ax_l.plot(range(n_configs), oof_vals, "o-", lw=2.2, ms=9, color="#1f77b4")
+    for xi, (v, lbl) in enumerate(zip(oof_vals, SHORT_LABELS)):
+        ax_l.annotate(f"{v:.4f}", (xi, v), textcoords="offset points",
+                      xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
+    ax_l.set_xticks(range(n_configs))
+    ax_l.set_xticklabels(SHORT_LABELS, fontsize=9.5)
+    ax_l.set_ylabel("OOF Macro F1", fontsize=11)
+    ax_l.set_title("OOF Macro F1 vs. Feature Group Configuration", fontsize=11)
+    ax_l.set_ylim(0.715, 0.750)
+    ax_l.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax_l.set_axisbelow(True)
+
+    # Right: marginal gain relative to Config 1 baseline
+    ax_r = axes[1]
+    baseline_oof = oof_vals[0]
+    deltas = [v - baseline_oof for v in oof_vals]
+    feat_labels = ["Base\n(–)", "+RV_CV\nonly", "+Jerk\nonly", "+Both\n(Full v13)"]
+    bar_colors = ["#aec7e8", "#ffbb78", "#98df8a", "#1f77b4"]
+    ax_r.bar(range(n_configs), deltas, color=bar_colors, alpha=0.88, width=0.55)
+    # Set ylim before annotating so label positions are inside axes
+    r_top = max(deltas) + 0.003
+    ax_r.set_ylim(0, r_top)
+    for xi, d in enumerate(deltas):
+        ax_r.text(xi, d + 0.0003, f"{d:+.4f}", ha="center", va="bottom",
+                  fontsize=10, fontweight="bold")
+    ax_r.axhline(0, color="black", lw=0.8)
+    ax_r.set_xticks(range(n_configs))
+    ax_r.set_xticklabels(feat_labels, fontsize=10)
+    ax_r.set_ylabel("ΔOOF Macro F1 vs. Config 1 (Base Only)", fontsize=11)
+    ax_r.set_title("Marginal Gain from Each Feature Group", fontsize=11)
+    ax_r.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax_r.set_axisbelow(True)
+
+    fig.suptitle("Phase C Ablation — Feature Group Impact on OOF Macro F1", fontsize=13,
+                 fontweight="bold", y=1.01)
+    fig.tight_layout()
+    path3 = os.path.join(plots_dir, "08_ablation_marginal_contribution.png")
+    fig.savefig(path3, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] Saved: {path3}")
+
+    print(f"[Plot] All ablation charts saved to '{plots_dir}/'.")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--plot-only" in sys.argv:
+        print("[Plot-only mode] Generating ablation charts from pre-computed results ...")
+        generate_ablation_plots()
+    else:
+        main()

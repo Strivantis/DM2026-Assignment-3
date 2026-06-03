@@ -25,13 +25,6 @@ Architecture outline (v10, nb_filters=64)
     Global Average Pooling (B, C, L) → (B, C)
     Dropout(0.4) → Linear → 6 (flat 6-class logits)
 
-v10 Changes
-──────────
-  • Completely decommissions all hierarchical Stage 1 / Stage 2 components.
-  • Flat 6-class global output head replacing dual-stage logit outputs.
-  • Injects a 1D Squeeze-and-Excitation (SE) block after every Inception block.
-  • Increases nb_filters default to 64 for richer feature extraction.
-
 Squeeze-and-Excitation Block (1D)
 ───────────────────────────────────
   Squeeze: Global Average Pooling over temporal axis (B, C, L) → (B, C)
@@ -39,13 +32,6 @@ Squeeze-and-Excitation Block (1D)
     Linear(C → C//r) → ReLU
     Linear(C//r → C) → Sigmoid
   Scale: multiply channel-wise attention weights back onto feature maps
-
-Regularisation (v10)
-────────────────────
-  • BN after each inception block concatenation.
-  • SE channel attention per block.
-  • Dropout(0.4) in classifier head.
-  • Kaiming / Xavier weight initialisation.
 """
 
 import torch
@@ -220,7 +206,7 @@ class InceptionTime1D(nn.Module):
         # Build `depth` SE-Inception blocks
         self.inception_blocks = nn.ModuleList()
         ch = in_channels
-        for i in range(depth):
+        for _ in range(depth):
             self.inception_blocks.append(
                 SEInceptionBlock1D(ch,
                                    nb_filters=nb_filters,

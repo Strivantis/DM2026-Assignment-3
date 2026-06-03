@@ -8,57 +8,21 @@ Data format:
   - Each CSV: 300 rows × columns [index, mean_x, mean_y, mean_z, std_x, std_y, std_z, label, file_id]
   - Raw feature shape after loading:  (300, 6)
   - 8-channel feature matrix:         (300, 8)  →  transposed to (8, 300) for 1D-CNN
-  - Train users: User_001 – User_060
-  - Test  users: User_061 – User_100
 
-Feature Engineering (v7 — Stable 8-Channel Baseline)
-------------------------------------------------------
-  Reverts to the stable v5 8-channel configuration.  The v6 radical pruning
-  and instance mean centering are completely removed.  The 8-channel set is:
+Channel map (8 channels):
+  [0] mean_x, [1] mean_y, [2] mean_z  – raw sliding-window means
+  [3] std_x,  [4] std_y,  [5] std_z   – raw sliding-window std deviations
+  [6] mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)  (direction magnitude)
+  [7] std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)  (motion energy)
 
-   Channel Map (8 channels):
-     [0] mean_x   – raw X-axis sliding-window mean
-     [1] mean_y   – raw Y-axis sliding-window mean
-     [2] mean_z   – raw Z-axis sliding-window mean
-     [3] std_x    – X-axis sliding-window standard deviation
-     [4] std_y    – Y-axis sliding-window standard deviation
-     [5] std_z    – Z-axis sliding-window standard deviation
-     [6] mean_mag = sqrt(mean_x² + mean_y² + mean_z² + 1e-8)  (direction magnitude)
-     [7] std_mag  = sqrt(std_x²  + std_y²  + std_z²  + 1e-8)  (motion energy)
+Label modes (build_fold_datasets `mode` argument):
+  'stage1' – 5-class: L0→0, L1/L2→1, L3→2, L4→3, L5→4
+  'stage2' – 2-class specialist: L1→0, L2→1 (other samples filtered out)
+  'flat'   – original 6-class labels unchanged
 
-  Final output shape per sample: (8, 300).
-
-Dynamic Label Modes (v7 — Hierarchical Two-Stage Classifier)
--------------------------------------------------------------
-  The HARDataset and corresponding factory functions accept a `mode` argument:
-
-  stage1 — 5-Class Generalist:
-    Original Labels 1 and 2 are merged into a single category.
-    Mapping:  L0 → 0 | L1,L2 → 1 | L3 → 2 | L4 → 3 | L5 → 4
-    Total output classes = 5.
-
-  stage2 — 2-Class Specialist:
-    Only samples whose original label is 1 or 2 are retained.
-    All other samples are filtered out.
-    Mapping:  L1 → 0 | L2 → 1
-    Total output classes = 2.
-
-Augmentation (v3/v5, unchanged)
----------------------------------
-  Applied to ALL training samples (global, not minority-only) with probability
-  AUG_PROB per technique to prevent subject-signature memorisation.
-
-  PROTECTED EXEMPTION (v3/v5): Label 2 samples are STRICTLY PROHIBITED from
-  receiving Time Masking (Cutout 1D).  In stage2 mode Label 2 maps to index 1,
-  so the protection logic checks the original label before mapping.
-
-  • Time Masking (Cutout 1D)  – zero out a random window of 15-30 time-steps
-                                 [DISABLED for original label == 2]
-  • Channel Masking (Sensor Dropout) – zero out 1–2 random feature channels
-  • Jitter                    – add Gaussian noise
-  • Scale                     – multiply by per-channel random scalar
-
-  All augmentations are disabled during validation and testing.
+Augmentation: applied to all training samples with probability AUG_PROB per
+technique. Label 2 is exempt from Time Masking (checked against original label
+before any remapping). All augmentations disabled during validation/testing.
 """
 
 import os
@@ -410,7 +374,7 @@ def build_fold_datasets(train_root: str,
     """
     Full pipeline for one CV fold with dynamic label mode.
 
-    Processing order (v7):
+    Processing order:
       1. Load raw feature arrays → (N, 300, 8)  [mean_x/y/z + std_x/y/z + mean_mag + std_mag]
       2. Split into train/val using StratifiedGroupKFold on original labels
       3. Compute per-fold Z-score statistics from training fold only  (no leakage)
