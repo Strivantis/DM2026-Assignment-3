@@ -4,3 +4,5 @@ train/*
 *.csv
 *.txt
 checkpoints/*
+__pycache__/
+*.pyc
