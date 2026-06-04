@@ -1,8 +1,0 @@
-test/*
-train/*
-*.md
-*.csv
-*.txt
-checkpoints/*
-__pycache__/
-*.pyc
