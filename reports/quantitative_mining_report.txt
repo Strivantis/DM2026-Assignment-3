@@ -1,0 +1,52 @@
+=== HAR Quantitative Mining Report ===
+
+[1. Feature Importance (Random Forest Gini Index)]
+  std_z          : 0.187010
+  std_mag        : 0.185806
+  std_x          : 0.180082
+  std_y          : 0.155481
+  mean_mag       : 0.084549
+  mean_x         : 0.072005
+  mean_y         : 0.068826
+  mean_z         : 0.066241
+
+[2. Feature Collinearity (|Pearson r| > 0.7)]
+  std_x & std_y: 0.9324
+  std_x & std_z: 0.9526
+  std_x & std_mag: 0.9817
+  std_y & std_z: 0.9399
+  std_y & std_mag: 0.9787
+  std_z & std_mag: 0.9795
+
+[3. Cross-User Covariate Shift (Coefficient of Variation)]
+  Metric: std/mean of per-user class averages. Higher = more user bias.
+
+  --- Label 0 (L0) ---
+    mean_x       CV: 161.2802
+    mean_y       CV: 58.7215
+    mean_z       CV: 1.8115
+
+  --- Label 1 (L1 (Running)) ---
+    mean_y       CV: 4.6683
+    mean_x       CV: 1.7668
+    mean_z       CV: 1.2117
+
+  --- Label 2 (L2 (Stairs Up)) ---
+    mean_y       CV: 11.3925
+    mean_z       CV: 9.0175
+    mean_x       CV: 2.3477
+
+  --- Label 3 (L3) ---
+    mean_z       CV: 14.5378
+    mean_y       CV: 2.3679
+    mean_x       CV: 1.8489
+
+  --- Label 4 (L4) ---
+    mean_y       CV: 6.0736
+    mean_x       CV: 4.2688
+    mean_z       CV: 0.5728
+
+  --- Label 5 (L5) ---
+    mean_y       CV: 3.3299
+    mean_z       CV: 2.1162
+    mean_x       CV: 1.6578
