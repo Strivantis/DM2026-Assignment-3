@@ -1,12 +1,3 @@
-# HAR SE-InceptionTime OOF Stacking Pipeline — v13
-
-Human Activity Recognition via a 3-phase pipeline:  
-**Phase A** SE-InceptionTime base model (5-fold OOF) → **Phase B** handcrafted tabular features → **Phase C** LightGBM meta-learner (Optuna-tuned).
-
-Public leaderboard Macro F1: **0.8078**
-
----
-
 ## Table of Contents
 
 1. [Environment Setup & Requirements](#1-environment-setup--requirements)
